@@ -103,6 +103,37 @@ API key 可以随便填一个本地值；如果你设置了 `GPT2CC_PROXY_API_KE
 
 环境变量使用 `GPT2CC_*` 作为新前缀；旧版 `CCPROXY_*` 仍作为兼容别名可用。如果两个前缀同时设置，`GPT2CC_*` 优先。
 
+## Web 管理界面
+
+启动代理后打开：
+
+```text
+http://127.0.0.1:3456/admin
+```
+
+管理界面可以添加多个中转站，并为每个中转站维护可用模型列表。切换中转站或模型后，不需要重启代理；新的 `/v1/messages` 请求会立即使用当前选择，已经开始的流式请求会继续使用它开始时的配置。
+
+如果设置了 `GPT2CC_PROXY_API_KEY`，打开管理界面后需要输入同一个本地代理 key。这个 key 只保存在当前浏览器会话的 `sessionStorage` 中，并通过 `x-api-key` header 发送。
+
+界面保存的中转站配置会写入 JSON 配置文件：
+
+- 如果设置了 `GPT2CC_CONFIG` 或旧别名 `CCPROXY_CONFIG`，写入该文件
+- 否则写入当前目录下的 `gpt2cc.config.json`
+
+这个文件包含上游 API key，已经在 `.gitignore` 中默认忽略，不要提交到仓库。
+
+Provider 配置示例见 `config.example.json`。每个中转站至少需要：
+
+```json
+{
+  "id": "main-relay",
+  "name": "Main relay",
+  "upstream_base_url": "https://your-relay.example.com/v1",
+  "upstream_api_key": "sk-your-upstream-key",
+  "models": ["gpt-4.1", "gpt-image-2"]
+}
+```
+
 ## 推荐配置
 
 最常用的 `.env`：
@@ -153,7 +184,7 @@ GPT2CC_UPSTREAM_SSL_VERIFY=true
 GPT2CC_UPSTREAM_SSL_VERIFY=false
 ```
 
-改完 `.env` 后必须重启 `gpt2cc`。关闭校验会让代理无法确认上游服务器身份，不建议长期使用。
+改完 `.env` 后通常需要重启 `gpt2cc`。如果只是切换管理界面里的中转站或模型，不需要重启。关闭校验会让代理无法确认上游服务器身份，不建议长期使用。
 
 另一个容易混淆的点：如果设置了 `GPT2CC_PROXY_API_KEY=local-claude-code-key`，那么 Claude Code 的 `ANTHROPIC_AUTH_TOKEN` 或 ccswitch 里填写的 API key 也必须是 `local-claude-code-key`。本地代理 key 不需要等于中转站 API key。
 

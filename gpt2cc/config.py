@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import re
+import threading
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 
 TRUTHY = {"1", "true", "yes", "y", "on"}
+DEFAULT_CONFIG_PATH = "gpt2cc.config.json"
+PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -121,13 +126,14 @@ def _env_value(env_name: str) -> str | None:
     return None
 
 
+def config_path_from_env() -> str:
+    return _env_value("GPT2CC_CONFIG") or DEFAULT_CONFIG_PATH
+
+
 def _load_json_config() -> dict[str, Any]:
-    path = _env_value("GPT2CC_CONFIG")
-    if not path:
-        return {}
-    config_path = Path(path)
+    config_path = Path(config_path_from_env())
     if not config_path.exists():
-        raise FileNotFoundError(f"GPT2CC_CONFIG/CCPROXY_CONFIG does not exist: {config_path}")
+        return {}
     data = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("GPT2CC_CONFIG/CCPROXY_CONFIG must contain a JSON object")
@@ -181,6 +187,10 @@ class Config:
     image_moderation: str = ""
     image_input_fidelity: str = ""
     image_max_reference_images: int = 16
+    providers: list[dict[str, Any]] = field(default_factory=list)
+    active_provider: str = "default"
+    active_model: str = ""
+    config_path: str = DEFAULT_CONFIG_PATH
 
     @property
     def upstream_chat_url(self) -> str:
@@ -263,11 +273,225 @@ class Config:
             "image_moderation": self.image_moderation,
             "image_input_fidelity": self.image_input_fidelity,
             "image_max_reference_images": self.image_max_reference_images,
+            "active_provider": self.active_provider,
+            "active_model": self.active_model,
+            "providers": redacted_providers(self.providers),
+            "config_path": self.config_path,
         }
+
+
+def normalize_provider(value: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    provider_id = str(value.get("id") or "").strip()
+    if not provider_id or not PROVIDER_ID_RE.match(provider_id):
+        raise ValueError("provider id may only contain letters, numbers, dots, underscores, and dashes")
+
+    base_url = str(value.get("upstream_base_url") or value.get("base_url") or "").strip().rstrip("/")
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        raise ValueError("provider upstream_base_url must start with http:// or https://")
+
+    api_key = str(value.get("upstream_api_key") or value.get("api_key") or "")
+    if not api_key and existing:
+        api_key = str(existing.get("upstream_api_key") or "")
+
+    models = parse_list_value(value.get("models"))
+    provider = {
+        "id": provider_id,
+        "name": str(value.get("name") or provider_id).strip() or provider_id,
+        "upstream_base_url": base_url,
+        "upstream_api_key": api_key,
+        "models": models,
+        "upstream_chat_path": str(value.get("upstream_chat_path") or (existing or {}).get("upstream_chat_path") or "/chat/completions"),
+        "upstream_images_generations_path": str(
+            value.get("upstream_images_generations_path")
+            or (existing or {}).get("upstream_images_generations_path")
+            or "/images/generations"
+        ),
+        "upstream_images_edits_path": str(
+            value.get("upstream_images_edits_path") or (existing or {}).get("upstream_images_edits_path") or "/images/edits"
+        ),
+        "upstream_auth_header": str(value.get("upstream_auth_header") or (existing or {}).get("upstream_auth_header") or "Authorization"),
+        "upstream_auth_scheme": str(value.get("upstream_auth_scheme") if value.get("upstream_auth_scheme") is not None else (existing or {}).get("upstream_auth_scheme", "Bearer")),
+    }
+    return provider
+
+
+def provider_from_config(config: Config) -> dict[str, Any]:
+    model = config.model or "gpt-4.1"
+    return {
+        "id": "default",
+        "name": "Default relay",
+        "upstream_base_url": config.upstream_base_url,
+        "upstream_api_key": config.upstream_api_key,
+        "models": [model] if model else [],
+        "upstream_chat_path": config.upstream_chat_path,
+        "upstream_images_generations_path": config.upstream_images_generations_path,
+        "upstream_images_edits_path": config.upstream_images_edits_path,
+        "upstream_auth_header": config.upstream_auth_header,
+        "upstream_auth_scheme": config.upstream_auth_scheme,
+    }
+
+
+def redacted_providers(providers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for provider in providers:
+        safe = dict(provider)
+        has_key = bool(safe.get("upstream_api_key"))
+        safe["upstream_api_key"] = "***" if has_key else ""
+        safe["has_api_key"] = has_key
+        result.append(safe)
+    return result
+
+
+def apply_provider(config: Config, provider: dict[str, Any], model: str) -> Config:
+    return replace(
+        config,
+        upstream_base_url=str(provider.get("upstream_base_url") or config.upstream_base_url),
+        upstream_api_key=str(provider.get("upstream_api_key") or ""),
+        upstream_chat_path=str(provider.get("upstream_chat_path") or config.upstream_chat_path),
+        upstream_images_generations_path=str(
+            provider.get("upstream_images_generations_path") or config.upstream_images_generations_path
+        ),
+        upstream_images_edits_path=str(provider.get("upstream_images_edits_path") or config.upstream_images_edits_path),
+        upstream_auth_header=str(provider.get("upstream_auth_header") or config.upstream_auth_header),
+        upstream_auth_scheme=str(provider.get("upstream_auth_scheme") if provider.get("upstream_auth_scheme") is not None else config.upstream_auth_scheme),
+        model=model,
+    )
+
+
+def copy_config(config: Config) -> Config:
+    return replace(
+        config,
+        model_map=dict(config.model_map),
+        extra_headers=dict(config.extra_headers),
+        image_models=list(config.image_models),
+        providers=copy.deepcopy(config.providers),
+    )
+
+
+class ConfigStore:
+    def __init__(self, config: Config):
+        self._lock = threading.RLock()
+        self._config = copy_config(config)
+
+    def snapshot(self) -> Config:
+        with self._lock:
+            return copy_config(self._config)
+
+    def state(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "active_provider": self._config.active_provider,
+                "active_model": self._config.active_model or self._config.model,
+                "providers": redacted_providers(self._config.providers),
+                "config_path": self._config.config_path,
+                "auth_required": bool(self._config.proxy_api_key),
+            }
+
+    def add_or_update_provider(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            existing = next((p for p in self._config.providers if p.get("id") == payload.get("id")), None)
+            provider = normalize_provider(payload, existing)
+            providers = [p for p in self._config.providers if p.get("id") != provider["id"]]
+            providers.append(provider)
+            active_provider = self._config.active_provider
+            active_model = self._config.active_model
+            config = replace(self._config, providers=providers)
+            if not active_provider or active_provider == provider["id"]:
+                active_provider = provider["id"]
+                active_model = active_model or (provider["models"][0] if provider["models"] else self._config.model)
+                config = self._activate(config, active_provider, active_model)
+            self._config = config
+            self.save()
+            return self.state()
+
+    def delete_provider(self, provider_id: str) -> dict[str, Any]:
+        with self._lock:
+            providers = [p for p in self._config.providers if p.get("id") != provider_id]
+            if len(providers) == len(self._config.providers):
+                raise ValueError("provider not found")
+            if not providers:
+                raise ValueError("at least one provider is required")
+            config = replace(self._config, providers=providers)
+            if self._config.active_provider == provider_id:
+                provider = providers[0]
+                model = provider["models"][0] if provider.get("models") else self._config.model
+                config = self._activate(config, str(provider["id"]), model)
+            self._config = config
+            self.save()
+            return self.state()
+
+    def set_active(self, provider_id: str, model: str) -> dict[str, Any]:
+        with self._lock:
+            self._config = self._activate(self._config, provider_id, model)
+            self.save()
+            return self.state()
+
+    def _activate(self, config: Config, provider_id: str, model: str) -> Config:
+        provider = next((p for p in config.providers if p.get("id") == provider_id), None)
+        if not provider:
+            raise ValueError("provider not found")
+        models = [str(item) for item in provider.get("models") or []]
+        model = str(model or (models[0] if models else config.model or "gpt-4.1")).strip()
+        if models and model not in models:
+            raise ValueError("model is not listed for this provider")
+        config = replace(config, active_provider=provider_id, active_model=model)
+        return apply_provider(config, provider, model)
+
+    def save(self) -> None:
+        data = config_to_json(self._config)
+        path = Path(self._config.config_path)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def config_to_json(config: Config) -> dict[str, Any]:
+    return {
+        "host": config.host,
+        "port": config.port,
+        "upstream_base_url": config.upstream_base_url,
+        "upstream_chat_path": config.upstream_chat_path,
+        "upstream_images_generations_path": config.upstream_images_generations_path,
+        "upstream_images_edits_path": config.upstream_images_edits_path,
+        "upstream_api_key": config.upstream_api_key,
+        "upstream_auth_header": config.upstream_auth_header,
+        "upstream_auth_scheme": config.upstream_auth_scheme,
+        "upstream_ssl_verify": config.upstream_ssl_verify,
+        "upstream_ca_bundle": config.upstream_ca_bundle,
+        "proxy_api_key": config.proxy_api_key,
+        "model": config.model,
+        "model_map": config.model_map,
+        "pass_through_model": config.pass_through_model,
+        "timeout_seconds": config.timeout_seconds,
+        "max_retries": config.max_retries,
+        "max_body_bytes": config.max_body_bytes,
+        "log_level": config.log_level,
+        "debug_payloads": config.debug_payloads,
+        "cors": config.cors,
+        "stream_include_usage": config.stream_include_usage,
+        "retry_without_stream_options": config.retry_without_stream_options,
+        "max_tokens_field": config.max_tokens_field,
+        "omit_temperature": config.omit_temperature,
+        "omit_top_p": config.omit_top_p,
+        "force_stream": config.force_stream,
+        "extra_headers": config.extra_headers,
+        "image_models": config.image_models,
+        "image_output_dir": config.image_output_dir,
+        "image_size": config.image_size,
+        "image_quality": config.image_quality,
+        "image_background": config.image_background,
+        "image_output_format": config.image_output_format,
+        "image_n": config.image_n,
+        "image_moderation": config.image_moderation,
+        "image_input_fidelity": config.image_input_fidelity,
+        "image_max_reference_images": config.image_max_reference_images,
+        "active_provider": config.active_provider,
+        "active_model": config.active_model,
+        "providers": config.providers,
+    }
 
 
 def load_config() -> Config:
     load_dotenv()
+    config_path = config_path_from_env()
     file_config = _load_json_config()
 
     config = Config(
@@ -347,7 +571,23 @@ def load_config() -> Config:
         image_max_reference_images=int(
             _cfg(file_config, "image_max_reference_images", "GPT2CC_IMAGE_MAX_REFERENCE_IMAGES", 16)
         ),
+        config_path=config_path,
     )
+
+    raw_providers = file_config.get("providers")
+    if isinstance(raw_providers, list) and raw_providers:
+        providers = [normalize_provider(item) for item in raw_providers if isinstance(item, dict)]
+    else:
+        providers = [provider_from_config(config)]
+    active_provider = str(_cfg(file_config, "active_provider", "GPT2CC_ACTIVE_PROVIDER", providers[0]["id"]))
+    env_model = _env_value("GPT2CC_UPSTREAM_MODEL")
+    active_model = str(env_model or _cfg(file_config, "active_model", "GPT2CC_ACTIVE_MODEL", config.model or ""))
+    if not active_model:
+        provider = next((p for p in providers if p["id"] == active_provider), providers[0])
+        active_model = (provider.get("models") or [config.model or "gpt-4.1"])[0]
+    config = replace(config, providers=providers, active_provider=active_provider, active_model=active_model)
+    active = next((p for p in providers if p["id"] == active_provider), providers[0])
+    config = apply_provider(config, active, active_model)
 
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),

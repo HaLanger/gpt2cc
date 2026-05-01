@@ -23,6 +23,7 @@ dist/
 .env.*
 !.env.example
 config.json
+gpt2cc.config.json
 .claude/
 
 # Generated outputs

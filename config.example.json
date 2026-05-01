@@ -1,19 +1,32 @@
 {
   "host": "127.0.0.1",
   "port": 3456,
-  "upstream_base_url": "https://your-codex-relay.example.com/v1",
-  "upstream_chat_path": "/chat/completions",
-  "upstream_images_generations_path": "/images/generations",
-  "upstream_images_edits_path": "/images/edits",
-  "upstream_api_key": "sk-your-upstream-key",
+  "active_provider": "main-relay",
+  "active_model": "gpt-4.1",
+  "providers": [
+    {
+      "id": "main-relay",
+      "name": "Main relay",
+      "upstream_base_url": "https://your-codex-relay.example.com/v1",
+      "upstream_api_key": "sk-your-upstream-key",
+      "models": ["gpt-4.1", "gpt-image-2"],
+      "upstream_chat_path": "/chat/completions",
+      "upstream_images_generations_path": "/images/generations",
+      "upstream_images_edits_path": "/images/edits",
+      "upstream_auth_header": "Authorization",
+      "upstream_auth_scheme": "Bearer"
+    },
+    {
+      "id": "backup-relay",
+      "name": "Backup relay",
+      "upstream_base_url": "https://your-backup-relay.example.com/v1",
+      "upstream_api_key": "sk-your-backup-key",
+      "models": ["gpt-4.1-mini", "gpt-image-2"]
+    }
+  ],
+  "proxy_api_key": "local-claude-code-key",
   "upstream_ssl_verify": true,
   "upstream_ca_bundle": "",
-  "model": "gpt-4.1",
-  "model_map": {
-    "claude-sonnet-4-5-20250929": "gpt-4.1",
-    "claude-3-5-sonnet-20241022": "gpt-4.1"
-  },
-  "proxy_api_key": "",
   "timeout_seconds": 600,
   "max_retries": 1,
   "stream_include_usage": true,

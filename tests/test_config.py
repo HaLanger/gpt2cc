@@ -1,8 +1,11 @@
+import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from gpt2cc.config import load_config
+from gpt2cc.config import ConfigStore, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -30,6 +33,67 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             config = load_config()
         self.assertEqual(config.model, "gpt-image-2")
+
+    def test_loads_provider_config_and_applies_active_model(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "active_provider": "relay2",
+                        "active_model": "gpt-image-2",
+                        "providers": [
+                            {
+                                "id": "relay1",
+                                "name": "Relay 1",
+                                "upstream_base_url": "https://relay1.example/v1",
+                                "upstream_api_key": "sk-relay1",
+                                "models": ["gpt-4.1"],
+                            },
+                            {
+                                "id": "relay2",
+                                "name": "Relay 2",
+                                "upstream_base_url": "https://relay2.example/v1",
+                                "upstream_api_key": "sk-relay2",
+                                "models": ["gpt-image-2"],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                config = load_config()
+        self.assertEqual(config.upstream_base_url, "https://relay2.example/v1")
+        self.assertEqual(config.upstream_api_key, "sk-relay2")
+        self.assertEqual(config.model, "gpt-image-2")
+
+    def test_config_store_redacts_and_preserves_existing_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                store = ConfigStore(load_config())
+                store.add_or_update_provider(
+                    {
+                        "id": "relay",
+                        "name": "Relay",
+                        "upstream_base_url": "https://relay.example/v1",
+                        "upstream_api_key": "sk-secret",
+                        "models": ["gpt-4.1"],
+                    }
+                )
+                state = store.add_or_update_provider(
+                    {
+                        "id": "relay",
+                        "name": "Relay Updated",
+                        "upstream_base_url": "https://relay.example/v1",
+                        "models": ["gpt-4.1", "gpt-image-2"],
+                    }
+                )
+        relay = next(provider for provider in state["providers"] if provider["id"] == "relay")
+        self.assertEqual(relay["upstream_api_key"], "***")
+        self.assertTrue(relay["has_api_key"])
+        self.assertEqual(store.snapshot().providers[-1]["upstream_api_key"], "sk-secret")
 
 
 if __name__ == "__main__":
