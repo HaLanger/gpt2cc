@@ -112,6 +112,7 @@ def convert_message(message: dict[str, Any], ctx: TransformContext) -> list[dict
 def convert_assistant_message(content: Any, ctx: TransformContext) -> dict[str, Any]:
     blocks = normalize_blocks(content)
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
 
     for block in blocks:
@@ -134,7 +135,9 @@ def convert_assistant_message(content: Any, ctx: TransformContext) -> dict[str, 
                 }
             )
         elif block_type in {"thinking", "redacted_thinking"}:
-            continue
+            thinking = convert_thinking_block(block)
+            if thinking:
+                reasoning_parts.append(thinking)
         else:
             text = block_to_text(block)
             if text:
@@ -142,6 +145,8 @@ def convert_assistant_message(content: Any, ctx: TransformContext) -> dict[str, 
 
     content_text = "\n".join(text_parts) if text_parts else ""
     result: dict[str, Any] = {"role": "assistant", "content": content_text if content_text or not tool_calls else None}
+    if reasoning_parts:
+        result["reasoning_content"] = "\n".join(reasoning_parts)
     if tool_calls:
         result["tool_calls"] = tool_calls
     return result
@@ -153,7 +158,8 @@ def convert_user_message(content: Any) -> list[dict[str, Any]]:
     user_blocks: list[dict[str, Any]] = []
 
     for block in blocks:
-        if block.get("type") == "tool_result":
+        block_type = block.get("type")
+        if block_type == "tool_result":
             tool_messages.append(
                 {
                     "role": "tool",
@@ -161,8 +167,10 @@ def convert_user_message(content: Any) -> list[dict[str, Any]]:
                     "content": tool_result_to_text(block),
                 }
             )
-        elif block.get("type") in {"thinking", "redacted_thinking"}:
-            continue
+        elif block_type in {"thinking", "redacted_thinking"}:
+            thinking = convert_thinking_block(block)
+            if thinking:
+                user_blocks.append({"type": "text", "text": thinking})
         else:
             user_blocks.append(block)
 
@@ -270,6 +278,18 @@ def anthropic_blocks_to_text(content: Any) -> str:
     blocks = normalize_blocks(content)
     text = [block_to_text(block) for block in blocks]
     return "\n".join(part for part in text if part)
+
+
+
+def convert_thinking_block(block: dict[str, Any]) -> str:
+    if block.get("type") == "redacted_thinking":
+        data = block.get("data") or block.get("thinking") or ""
+        return json.dumps({"type": "redacted_thinking", "data": data}, ensure_ascii=False)
+    thinking = block.get("thinking") or block.get("text") or ""
+    signature = block.get("signature")
+    if signature:
+        return json.dumps({"type": "thinking", "thinking": thinking, "signature": signature}, ensure_ascii=False)
+    return str(thinking)
 
 
 def block_to_text(block: dict[str, Any]) -> str:

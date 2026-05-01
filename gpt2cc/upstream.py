@@ -79,16 +79,22 @@ def post_image_edit(config: Config, fields: dict[str, str], files: list[Multipar
     return post_multipart_url(config, config.upstream_images_edits_url, fields, files)
 
 
-def post_json_url(config: Config, url: str, payload: dict[str, Any]) -> UpstreamResponse:
+def post_json_url(
+    config: Config,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> UpstreamResponse:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     last_error: UpstreamError | None = None
     ssl_context = build_ssl_context(config)
+    request_headers = headers or build_headers(config, stream=False)
     for attempt in range(config.max_retries + 1):
         try:
             request = urllib.request.Request(
                 url,
                 data=body,
-                headers=build_headers(config, stream=False),
+                headers=request_headers,
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=config.timeout_seconds, context=ssl_context) as response:
@@ -190,14 +196,19 @@ def escape_multipart_name(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
 
 
-def open_stream(config: Config, payload: dict[str, Any]) -> BinaryIO:
+def open_stream_url(
+    config: Config,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> BinaryIO:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ssl_context = build_ssl_context(config)
     try:
         request = urllib.request.Request(
-            config.upstream_chat_url,
+            url,
             data=body,
-            headers=build_headers(config, stream=True),
+            headers=headers or build_headers(config, stream=True),
             method="POST",
         )
         return urllib.request.urlopen(request, timeout=config.timeout_seconds, context=ssl_context)
@@ -210,6 +221,10 @@ def open_stream(config: Config, payload: dict[str, Any]) -> BinaryIO:
         raise UpstreamError(502, format_ssl_error(exc)) from exc
     except TimeoutError as exc:
         raise UpstreamError(504, "upstream request timed out") from exc
+
+
+def open_stream(config: Config, payload: dict[str, Any]) -> BinaryIO:
+    return open_stream_url(config, config.upstream_chat_url, payload)
 
 
 def open_stream_with_retry(config: Config, payload: dict[str, Any]) -> BinaryIO:

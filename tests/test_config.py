@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gpt2cc.config import ConfigStore, load_config
+from gpt2cc.config import ConfigStore, ensure_config_file, load_config, normalize_provider
 
 
 class ConfigTests(unittest.TestCase):
@@ -152,6 +152,39 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
                 config = load_config()
         self.assertEqual(config.active_provider_label(), "Main Relay (relay1)")
+    def test_legacy_provider_defaults_to_openai_protocol(self):
+        provider = normalize_provider(
+            {
+                "id": "relay",
+                "upstream_base_url": "https://relay.example/v1",
+                "upstream_api_key": "sk-relay",
+                "models": ["gpt-4.1"],
+            }
+        )
+        self.assertEqual(provider["protocol"], "openai")
+
+    def test_invalid_provider_protocol_fails(self):
+        with self.assertRaisesRegex(ValueError, "provider protocol"):
+            normalize_provider(
+                {
+                    "id": "relay",
+                    "protocol": "unknown",
+                    "upstream_base_url": "https://relay.example/v1",
+                    "models": ["gpt-4.1"],
+                }
+            )
+
+    def test_ensure_config_file_creates_and_preserves_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                config = load_config()
+                self.assertTrue(ensure_config_file(config))
+                data = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual(data["providers"][0]["protocol"], "openai")
+                config_path.write_text('{"sentinel":true}\n', encoding="utf-8")
+                self.assertFalse(ensure_config_file(config))
+                self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), {"sentinel": True})
 
 
 if __name__ == "__main__":

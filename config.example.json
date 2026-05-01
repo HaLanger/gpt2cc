@@ -6,7 +6,8 @@
   "providers": [
     {
       "id": "main-relay",
-      "name": "Main relay",
+      "name": "Main OpenAI-compatible relay",
+      "protocol": "openai",
       "upstream_base_url": "https://your-codex-relay.example.com/v1",
       "upstream_api_key": "sk-your-upstream-key",
       "models": ["gpt-4.1", "gpt-image-2"],
@@ -17,11 +18,23 @@
       "upstream_auth_scheme": "Bearer"
     },
     {
-      "id": "backup-relay",
-      "name": "Backup relay",
-      "upstream_base_url": "https://your-backup-relay.example.com/v1",
-      "upstream_api_key": "sk-your-backup-key",
-      "models": ["gpt-4.1-mini", "gpt-image-2"]
+      "id": "anthropic-relay",
+      "name": "Anthropic relay",
+      "protocol": "anthropic",
+      "upstream_base_url": "https://api.anthropic.com/v1",
+      "upstream_api_key": "sk-ant-your-key",
+      "models": ["claude-sonnet-4-5-20250929"],
+      "upstream_messages_path": "/messages"
+    },
+    {
+      "id": "gemini-relay",
+      "name": "Gemini relay",
+      "protocol": "gemini",
+      "upstream_base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "upstream_api_key": "your-gemini-key",
+      "models": ["gemini-2.5-pro"],
+      "upstream_gemini_generate_path": "/models/{model}:generateContent",
+      "upstream_gemini_stream_path": "/models/{model}:streamGenerateContent"
     }
   ],
   "proxy_api_key": "local-claude-code-key",

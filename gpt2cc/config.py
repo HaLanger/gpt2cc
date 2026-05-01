@@ -14,6 +14,7 @@ from typing import Any
 TRUTHY = {"1", "true", "yes", "y", "on"}
 DEFAULT_CONFIG_PATH = "gpt2cc.config.json"
 PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+SUPPORTED_PROTOCOLS = {"openai", "anthropic", "gemini"}
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -152,7 +153,11 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 3456
     upstream_base_url: str = "https://api.openai.com/v1"
+    upstream_protocol: str = "openai"
     upstream_chat_path: str = "/chat/completions"
+    upstream_messages_path: str = "/messages"
+    upstream_gemini_generate_path: str = "/models/{model}:generateContent"
+    upstream_gemini_stream_path: str = "/models/{model}:streamGenerateContent"
     upstream_images_generations_path: str = "/images/generations"
     upstream_images_edits_path: str = "/images/edits"
     upstream_api_key: str = ""
@@ -204,24 +209,30 @@ class Config:
 
     @property
     def upstream_chat_url(self) -> str:
-        base = self.upstream_base_url.rstrip("/")
-        path = self.upstream_chat_path
-        if not path.startswith("/"):
-            path = "/" + path
-        return base + path
+        return self._join_upstream_path(self.upstream_chat_path)
 
     @property
     def upstream_images_generations_url(self) -> str:
-        base = self.upstream_base_url.rstrip("/")
-        path = self.upstream_images_generations_path
-        if not path.startswith("/"):
-            path = "/" + path
-        return base + path
+        return self._join_upstream_path(self.upstream_images_generations_path)
 
     @property
     def upstream_images_edits_url(self) -> str:
+        return self._join_upstream_path(self.upstream_images_edits_path)
+
+    @property
+    def upstream_messages_url(self) -> str:
+        return self._join_upstream_path(self.upstream_messages_path)
+
+    @property
+    def upstream_gemini_generate_url(self) -> str:
+        return self._join_upstream_path(self.upstream_gemini_generate_path.format(model=self.model))
+
+    @property
+    def upstream_gemini_stream_url(self) -> str:
+        return self._join_upstream_path(self.upstream_gemini_stream_path.format(model=self.model))
+
+    def _join_upstream_path(self, path: str) -> str:
         base = self.upstream_base_url.rstrip("/")
-        path = self.upstream_images_edits_path
         if not path.startswith("/"):
             path = "/" + path
         return base + path
@@ -249,7 +260,11 @@ class Config:
             "host": self.host,
             "port": self.port,
             "upstream_base_url": self.upstream_base_url,
+            "upstream_protocol": self.upstream_protocol,
             "upstream_chat_path": self.upstream_chat_path,
+            "upstream_messages_path": self.upstream_messages_path,
+            "upstream_gemini_generate_path": self.upstream_gemini_generate_path,
+            "upstream_gemini_stream_path": self.upstream_gemini_stream_path,
             "upstream_images_generations_path": self.upstream_images_generations_path,
             "upstream_images_edits_path": self.upstream_images_edits_path,
             "upstream_api_key": "***" if self.upstream_api_key else "",
@@ -303,14 +318,30 @@ def normalize_provider(value: dict[str, Any], existing: dict[str, Any] | None = 
     if not api_key and existing:
         api_key = str(existing.get("upstream_api_key") or "")
 
+    protocol = str(value.get("protocol") or value.get("upstream_protocol") or (existing or {}).get("protocol") or "openai").strip().lower()
+    if protocol not in SUPPORTED_PROTOCOLS:
+        raise ValueError("provider protocol must be one of: anthropic, gemini, openai")
+
     models = parse_list_value(value.get("models"))
     provider = {
         "id": provider_id,
         "name": str(value.get("name") or provider_id).strip() or provider_id,
+        "protocol": protocol,
         "upstream_base_url": base_url,
         "upstream_api_key": api_key,
         "models": models,
         "upstream_chat_path": str(value.get("upstream_chat_path") or (existing or {}).get("upstream_chat_path") or "/chat/completions"),
+        "upstream_messages_path": str(value.get("upstream_messages_path") or (existing or {}).get("upstream_messages_path") or "/messages"),
+        "upstream_gemini_generate_path": str(
+            value.get("upstream_gemini_generate_path")
+            or (existing or {}).get("upstream_gemini_generate_path")
+            or "/models/{model}:generateContent"
+        ),
+        "upstream_gemini_stream_path": str(
+            value.get("upstream_gemini_stream_path")
+            or (existing or {}).get("upstream_gemini_stream_path")
+            or "/models/{model}:streamGenerateContent"
+        ),
         "upstream_images_generations_path": str(
             value.get("upstream_images_generations_path")
             or (existing or {}).get("upstream_images_generations_path")
@@ -330,10 +361,14 @@ def provider_from_config(config: Config) -> dict[str, Any]:
     return {
         "id": "default",
         "name": "Default relay",
+        "protocol": config.upstream_protocol,
         "upstream_base_url": config.upstream_base_url,
         "upstream_api_key": config.upstream_api_key,
         "models": [model] if model else [],
         "upstream_chat_path": config.upstream_chat_path,
+        "upstream_messages_path": config.upstream_messages_path,
+        "upstream_gemini_generate_path": config.upstream_gemini_generate_path,
+        "upstream_gemini_stream_path": config.upstream_gemini_stream_path,
         "upstream_images_generations_path": config.upstream_images_generations_path,
         "upstream_images_edits_path": config.upstream_images_edits_path,
         "upstream_auth_header": config.upstream_auth_header,
@@ -355,9 +390,15 @@ def redacted_providers(providers: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def apply_provider(config: Config, provider: dict[str, Any], model: str) -> Config:
     return replace(
         config,
+        upstream_protocol=str(provider.get("protocol") or "openai"),
         upstream_base_url=str(provider.get("upstream_base_url") or config.upstream_base_url),
         upstream_api_key=str(provider.get("upstream_api_key") or ""),
         upstream_chat_path=str(provider.get("upstream_chat_path") or config.upstream_chat_path),
+        upstream_messages_path=str(provider.get("upstream_messages_path") or config.upstream_messages_path),
+        upstream_gemini_generate_path=str(
+            provider.get("upstream_gemini_generate_path") or config.upstream_gemini_generate_path
+        ),
+        upstream_gemini_stream_path=str(provider.get("upstream_gemini_stream_path") or config.upstream_gemini_stream_path),
         upstream_images_generations_path=str(
             provider.get("upstream_images_generations_path") or config.upstream_images_generations_path
         ),
@@ -394,6 +435,7 @@ class ConfigStore:
             return {
                 "active_provider": self._config.active_provider,
                 "active_model": self._config.active_model or self._config.model,
+                "active_protocol": self._config.upstream_protocol,
                 "providers": providers,
                 "config_path": self._config.config_path,
                 "auth_required": bool(self._config.proxy_api_key),
@@ -460,7 +502,11 @@ def config_to_json(config: Config) -> dict[str, Any]:
         "host": config.host,
         "port": config.port,
         "upstream_base_url": config.upstream_base_url,
+        "upstream_protocol": config.upstream_protocol,
         "upstream_chat_path": config.upstream_chat_path,
+        "upstream_messages_path": config.upstream_messages_path,
+        "upstream_gemini_generate_path": config.upstream_gemini_generate_path,
+        "upstream_gemini_stream_path": config.upstream_gemini_stream_path,
         "upstream_images_generations_path": config.upstream_images_generations_path,
         "upstream_images_edits_path": config.upstream_images_edits_path,
         "upstream_api_key": config.upstream_api_key,
@@ -501,6 +547,14 @@ def config_to_json(config: Config) -> dict[str, Any]:
     }
 
 
+def ensure_config_file(config: Config) -> bool:
+    path = Path(config.config_path)
+    if path.exists():
+        return False
+    path.write_text(json.dumps(config_to_json(config), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
 def load_config() -> Config:
     load_dotenv()
     config_path = config_path_from_env()
@@ -517,8 +571,26 @@ def load_config() -> Config:
                 "https://api.openai.com/v1",
             )
         ),
+        upstream_protocol=str(_cfg(file_config, "upstream_protocol", "GPT2CC_UPSTREAM_PROTOCOL", "openai")).lower(),
         upstream_chat_path=str(
             _cfg(file_config, "upstream_chat_path", "GPT2CC_UPSTREAM_CHAT_PATH", "/chat/completions")
+        ),
+        upstream_messages_path=str(_cfg(file_config, "upstream_messages_path", "GPT2CC_UPSTREAM_MESSAGES_PATH", "/messages")),
+        upstream_gemini_generate_path=str(
+            _cfg(
+                file_config,
+                "upstream_gemini_generate_path",
+                "GPT2CC_UPSTREAM_GEMINI_GENERATE_PATH",
+                "/models/{model}:generateContent",
+            )
+        ),
+        upstream_gemini_stream_path=str(
+            _cfg(
+                file_config,
+                "upstream_gemini_stream_path",
+                "GPT2CC_UPSTREAM_GEMINI_STREAM_PATH",
+                "/models/{model}:streamGenerateContent",
+            )
         ),
         upstream_images_generations_path=str(
             _cfg(
@@ -585,6 +657,9 @@ def load_config() -> Config:
         ),
         config_path=config_path,
     )
+
+    if config.upstream_protocol not in SUPPORTED_PROTOCOLS:
+        raise ValueError("upstream protocol must be one of: anthropic, gemini, openai")
 
     raw_providers = file_config.get("providers")
     if isinstance(raw_providers, list) and raw_providers:

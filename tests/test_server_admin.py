@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from gpt2cc.config import Config
-from gpt2cc.server import ReusableThreadingHTTPServer, make_handler
+from gpt2cc.server import ReusableThreadingHTTPServer, admin_url, make_handler, should_open_admin
 
 
 class AdminServerTests(unittest.TestCase):
@@ -58,6 +58,7 @@ class AdminServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         text = data.decode("utf-8")
         self.assertIn("gpt2cc relay console", text)
+        self.assertIn("Gemini native", text)
         self.assertNotIn("sk-initial", text)
 
     def test_add_provider_and_switch_active_model(self):
@@ -67,6 +68,7 @@ class AdminServerTests(unittest.TestCase):
             {
                 "id": "relay2",
                 "name": "Relay 2",
+                "protocol": "gemini",
                 "upstream_base_url": "https://relay2.example/v1",
                 "upstream_api_key": "sk-relay2",
                 "models": ["gpt-4.1", "gpt-image-2"],
@@ -76,6 +78,7 @@ class AdminServerTests(unittest.TestCase):
         state = json.loads(data.decode("utf-8"))
         relay = next(provider for provider in state["providers"] if provider["id"] == "relay2")
         self.assertEqual(relay["upstream_api_key"], "***")
+        self.assertEqual(relay["protocol"], "gemini")
         self.assertNotIn("sk-relay2", data.decode("utf-8"))
 
         status, _, data = self.request("POST", "/admin/active", {"provider_id": "relay2", "model": "gpt-image-2"})
@@ -88,6 +91,7 @@ class AdminServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         config = json.loads(data.decode("utf-8"))
         self.assertEqual(config["upstream_base_url"], "https://relay2.example/v1")
+        self.assertEqual(config["upstream_protocol"], "gemini")
         self.assertEqual(config["model"], "gpt-image-2")
         self.assertEqual(config["upstream_api_key"], "***")
 
@@ -99,6 +103,12 @@ class AdminServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("provider id", data.decode("utf-8"))
+    def test_admin_url_uses_localhost_for_loopback(self):
+        self.assertEqual(admin_url(Config(host="127.0.0.1", port=3456)), "http://localhost:3456/admin")
+        self.assertEqual(admin_url(Config(host="0.0.0.0", port=3456)), "http://localhost:3456/admin")
+
+    def test_should_open_admin_respects_opt_out(self):
+        self.assertFalse(should_open_admin(True))
 
 
 if __name__ == "__main__":

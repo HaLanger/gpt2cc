@@ -93,6 +93,27 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(payload["messages"][0]["role"], "assistant")
         self.assertEqual(payload["messages"][0]["tool_calls"][0]["id"], "call_1")
         self.assertEqual(payload["messages"][1], {"role": "tool", "tool_call_id": "call_1", "content": "/tmp"})
+    def test_assistant_thinking_blocks_are_preserved_for_upstream(self):
+        payload, _ = transform_anthropic_to_openai(
+            {
+                "model": "claude-test",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "reasoning", "signature": "sig_1"},
+                            {"type": "text", "text": "answer"},
+                        ],
+                    }
+                ],
+            },
+            Config(model="deepseek-v4"),
+        )
+        self.assertEqual(payload["messages"][0]["content"], "answer")
+        self.assertEqual(
+            payload["messages"][0]["reasoning_content"],
+            json.dumps({"type": "thinking", "thinking": "reasoning", "signature": "sig_1"}, ensure_ascii=False),
+        )
 
 
 if __name__ == "__main__":

@@ -49,43 +49,46 @@ Claude Code 使用 Anthropic Messages API，请求体大致是：
 
 ## 快速开始
 
-1. 复制配置文件：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-2. 修改 `.env`：
-
-```dotenv
-GPT2CC_UPSTREAM_BASE_URL=https://你的中转站域名/v1
-GPT2CC_UPSTREAM_API_KEY=你的中转站 API Key
-GPT2CC_UPSTREAM_MODEL=你的中转站模型名
-```
-
-如果你的中转站模型名是 `gpt-4.1`，可以保持示例值。如果是其他名字，例如 `gpt-5.1-codex`，把 `GPT2CC_UPSTREAM_MODEL` 改成对应值。
-
-3. 启动代理：
+1. 启动代理：
 
 ```powershell
 python -m gpt2cc
 ```
 
-默认监听：
+首次启动会自动创建本地配置文件：
 
 ```text
-http://127.0.0.1:3456
+gpt2cc.config.json
 ```
 
-4. 健康检查：
+并尝试自动打开管理界面：
+
+```text
+http://localhost:3456/admin
+```
+
+如果你在服务器、CI 或无浏览器环境运行，可以关闭自动打开：
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:3456/healthz
+python -m gpt2cc --no-open-admin
 ```
 
-## 配置 Claude Code
+也可以设置：
 
-Claude Code 支持通过环境变量设置 Anthropic API 地址。使用本代理时，把 Anthropic base URL 指到本地代理：
+```dotenv
+GPT2CC_OPEN_ADMIN=false
+```
+
+2. 在管理界面添加中转站：
+
+- 选择协议：`OpenAI-compatible`、`Anthropic Messages` 或 `Gemini native`
+- 填写中转站 Base URL
+- 填写上游 API key
+- 填写该中转站支持的模型列表，每行一个
+
+保存后，新请求会立即使用当前选择；已经开始的流式请求会继续使用它开始时的配置。
+
+3. 配置 Claude Code：
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:3456"
@@ -111,7 +114,13 @@ API key 可以随便填一个本地值；如果你设置了 `GPT2CC_PROXY_API_KE
 http://127.0.0.1:3456/admin
 ```
 
-管理界面可以添加多个中转站，并为每个中转站维护可用模型列表。切换中转站或模型后，不需要重启代理；新的 `/v1/messages` 请求会立即使用当前选择，已经开始的流式请求会继续使用它开始时的配置。
+管理界面可以添加多个中转站，并为每个中转站维护协议、Base URL、API key 和可用模型列表。切换中转站或模型后，不需要重启代理；新的 `/v1/messages` 请求会立即使用当前选择，已经开始的流式请求会继续使用它开始时的配置。
+
+协议含义：
+
+- `OpenAI-compatible`：当前最完整路径，支持聊天、工具调用，以及 `gpt-image-2` 等 Images API 生图/参考图编辑。
+- `Anthropic Messages`：上游本身兼容 Anthropic Messages API 时使用，代理会尽量直通请求和 SSE。
+- `Gemini native`：把 Claude Code 的 Anthropic 请求转换到 Gemini `generateContent` / `streamGenerateContent`，支持文本、基础工具调用和视觉输入；OpenAI Images API 生图仍建议使用 OpenAI-compatible provider。
 
 如果设置了 `GPT2CC_PROXY_API_KEY`，打开管理界面后需要输入同一个本地代理 key。这个 key 只保存在当前浏览器会话的 `sessionStorage` 中，并通过 `x-api-key` header 发送。
 
@@ -128,15 +137,20 @@ Provider 配置示例见 `config.example.json`。每个中转站至少需要：
 {
   "id": "main-relay",
   "name": "Main relay",
+  "protocol": "openai",
   "upstream_base_url": "https://your-relay.example.com/v1",
   "upstream_api_key": "sk-your-upstream-key",
   "models": ["gpt-4.1", "gpt-image-2"]
 }
-```
+``` 
 
-## 推荐配置
+旧版配置文件里的 provider 如果没有 `protocol` 字段，会自动按 `openai` 处理。
 
-最常用的 `.env`：
+## 高级：使用 `.env` / 环境变量预置配置
+
+普通本地使用不需要手写 `.env`，直接在 Web 管理界面配置即可。`.env` 和系统环境变量仍然保留，适合无浏览器服务器、CI、容器部署、批量预置默认值或兼容旧版配置。
+
+示例：
 
 ```dotenv
 GPT2CC_HOST=127.0.0.1
@@ -397,7 +411,7 @@ data: {"type":"message_stop"}
 - 默认只监听 `127.0.0.1`，不要直接暴露到公网
 - 如果需要局域网访问，务必设置 `GPT2CC_PROXY_API_KEY`
 - 不要在生产环境开启 `GPT2CC_DEBUG_PAYLOADS=true`，它会记录完整 prompt 和工具参数
-- 上游 API Key 只写在 `.env` 或系统环境变量里，不要提交到仓库
+- 上游 API Key 可能保存在 `.env`、系统环境变量或本地 `gpt2cc.config.json`，不要提交到仓库
 
 ## 调试
 

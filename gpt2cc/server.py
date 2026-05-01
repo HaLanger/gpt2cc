@@ -4,12 +4,27 @@ import argparse
 import html
 import json
 import logging
+import os
+import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
-from .config import Config, ConfigStore, load_config
+from .anthropic_upstream import (
+    build_anthropic_payload,
+    open_anthropic_stream,
+    post_anthropic_message,
+    stream_anthropic_passthrough,
+)
+from .config import Config, ConfigStore, ensure_config_file, load_config
+from .gemini import (
+    anthropic_message_from_gemini,
+    open_gemini_stream,
+    post_gemini,
+    stream_gemini_to_anthropic,
+    transform_anthropic_to_gemini,
+)
 from .image import (
     anthropic_message_from_image_result,
     build_image_edit_request,
@@ -143,6 +158,54 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
             if request_config.debug_payloads:
                 LOG.debug("anthropic request: %s", json.dumps(request, ensure_ascii=False))
 
+            if request_config.upstream_protocol == "anthropic":
+                self._handle_anthropic_messages(request, request_config)
+                return
+            if request_config.upstream_protocol == "gemini":
+                self._handle_gemini_messages(request, request_config)
+                return
+            self._handle_openai_messages(request, request_config)
+
+        def _handle_anthropic_messages(self, request: dict[str, Any], request_config: Config) -> None:
+            upstream_payload = build_anthropic_payload(request, request_config)
+            LOG.info(
+                "model route: requested=%s upstream=%s endpoint=anthropic/messages stream=%s protocol=anthropic provider=%s",
+                request.get("model") or "<empty>",
+                upstream_payload.get("model"),
+                upstream_payload.get("stream"),
+                request_config.active_provider_label(),
+            )
+            if upstream_payload.get("stream"):
+                upstream_stream = open_anthropic_stream(request_config, upstream_payload)
+                self._send_stream_headers()
+                with upstream_stream as response:
+                    stream_anthropic_passthrough(response, self._write_stream)
+                return
+            upstream_response = post_anthropic_message(request_config, upstream_payload)
+            self._send_json(upstream_response.json())
+
+        def _handle_gemini_messages(self, request: dict[str, Any], request_config: Config) -> None:
+            upstream_payload, ctx = transform_anthropic_to_gemini(request, request_config)
+            stream = bool(request.get("stream") or request_config.force_stream)
+            LOG.info(
+                "model route: requested=%s upstream=%s endpoint=gemini/generateContent stream=%s protocol=gemini provider=%s",
+                ctx.requested_model or "<empty>",
+                ctx.upstream_model,
+                stream,
+                request_config.active_provider_label(),
+            )
+            if request_config.debug_payloads:
+                LOG.debug("upstream gemini request: %s", json.dumps(upstream_payload, ensure_ascii=False))
+            if stream:
+                upstream_stream = open_gemini_stream(request_config, upstream_payload)
+                self._send_stream_headers()
+                with upstream_stream as response:
+                    stream_gemini_to_anthropic(response, ctx, self._write_stream)
+                return
+            upstream_response = post_gemini(request_config, upstream_payload)
+            self._send_json(anthropic_message_from_gemini(upstream_response.json(), ctx))
+
+        def _handle_openai_messages(self, request: dict[str, Any], request_config: Config) -> None:
             upstream_payload, ctx = transform_anthropic_to_openai(request, request_config)
             if is_image_model(ctx.upstream_model, request_config):
                 has_references = request_has_reference_images(request, request_config)
@@ -340,7 +403,7 @@ input,textarea,select {{ width:100%; border:1px solid var(--line); border-radius
 button {{ border:0; border-radius:12px; padding:10px 13px; font-weight:750; cursor:pointer; background:#e8eefc; color:#1e3a8a; white-space:nowrap; }} button.primary {{ background:var(--brand); color:white; }} button.danger {{ background:#fee2e2; color:#991b1b; }} button.ghost {{ background:#f8fafc; color:#334155; border:1px solid var(--line); }} button:hover {{ filter:brightness(.97); }}
 .banner {{ display:none; margin-bottom:14px; padding:11px 13px; border-radius:14px; font-weight:700; }} .banner.ok {{ display:block; background:#dcfce7; color:#166534; }} .banner.err {{ display:block; background:#fee2e2; color:#991b1b; }} .auth {{ display:none; margin-bottom:14px; }} .auth.show {{ display:block; }}
 .list {{ display:grid; gap:8px; }} .row {{ display:grid; grid-template-columns:1.35fr 1.2fr .9fr auto; gap:12px; align-items:center; padding:12px; border:1px solid var(--line); background:white; border-radius:16px; }} .row.active {{ border-color:#93c5fd; box-shadow:0 10px 30px rgba(37,99,235,.10); }}
-.name {{ font-weight:800; }} .sub {{ color:var(--muted); font-size:12px; margin-top:3px; word-break:break-all; }} .models {{ display:flex; flex-wrap:wrap; gap:5px; max-height:52px; overflow:hidden; }} .model {{ border:1px solid var(--line); background:#f8fafc; border-radius:999px; padding:4px 8px; font-size:12px; }} button.model {{ color:#334155; font-weight:750; }} button.model.active-model {{ background:#dbeafe; border-color:#93c5fd; color:#1d4ed8; }} .pill {{ border-radius:999px; padding:4px 9px; background:#eef2ff; color:#1d4ed8; font-size:12px; font-weight:800; display:inline-block; margin-left:6px; }} .actions {{ display:flex; gap:7px; justify-content:flex-end; flex-wrap:wrap; }} .empty {{ text-align:center; color:var(--muted); padding:32px; }}
+.name {{ font-weight:800; }} .sub {{ color:var(--muted); font-size:12px; margin-top:3px; word-break:break-all; }} .models {{ display:flex; flex-wrap:wrap; gap:5px; max-height:160px; overflow:auto; }} .model {{ border:1px solid var(--line); background:#f8fafc; border-radius:999px; padding:4px 8px; font-size:12px; }} button.model {{ color:#334155; font-weight:750; }} button.model.active-model {{ background:#dbeafe; border-color:#93c5fd; color:#1d4ed8; }} .pill {{ border-radius:999px; padding:4px 9px; background:#eef2ff; color:#1d4ed8; font-size:12px; font-weight:800; display:inline-block; margin-left:6px; }} .protocol {{ border-radius:999px; padding:3px 8px; background:#ecfdf5; color:#047857; font-size:11px; font-weight:800; display:inline-block; margin-left:6px; }} .actions {{ display:flex; gap:7px; justify-content:flex-end; flex-wrap:wrap; }} .empty {{ text-align:center; color:var(--muted); padding:32px; }}
 .drawer-backdrop {{ position:fixed; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:.18s; }} .drawer-backdrop.show {{ opacity:1; pointer-events:auto; }} .drawer {{ position:fixed; top:18px; right:18px; bottom:18px; width:min(460px,calc(100vw - 36px)); padding:20px; overflow:auto; transform:translateX(calc(100% + 28px)); transition:.2s; }} .drawer.show {{ transform:translateX(0); }} .drawer-head {{ display:flex; justify-content:space-between; align-items:center; gap:12px; }} .drawer h2 {{ margin:0; }} label {{ display:block; color:#334155; font-size:13px; font-weight:750; margin:13px 0 6px; }}
 @media (max-width:900px) {{ .hero,.toolbar,.row {{ grid-template-columns:1fr; }} .actions {{ justify-content:flex-start; }} }}
 </style>
@@ -353,7 +416,7 @@ button {{ border:0; border-radius:12px; padding:10px 13px; font-weight:750; curs
   <section class=\"panel\"><div class=\"toolbar\"><input id=\"searchBox\" placeholder=\"搜索中转站名称、ID、域名或模型...\" oninput=\"render()\"><button class=\"ghost\" onclick=\"clearSearch()\">清除搜索</button><button class=\"primary\" onclick=\"openForm()\">添加中转站</button></div><div id=\"providers\" class=\"list\"></div></section>
 </div>
 <div id=\"drawerBackdrop\" class=\"drawer-backdrop\" onclick=\"closeForm()\"></div>
-<aside id=\"drawer\" class=\"drawer\"><div class=\"drawer-head\"><h2 id=\"formTitle\">添加中转站</h2><button class=\"ghost\" onclick=\"closeForm()\">关闭</button></div><label>ID</label><input id=\"providerId\" placeholder=\"my-relay\"><label>名称</label><input id=\"providerName\" placeholder=\"My Relay\"><label>Base URL</label><input id=\"baseUrl\" placeholder=\"https://relay.example.com/v1\"><label>API key</label><input id=\"apiKey\" type=\"password\" placeholder=\"编辑时留空表示保留原 key\"><label>模型（每行一个）</label><textarea id=\"models\" placeholder=\"gpt-4.1&#10;gpt-image-2\"></textarea><div class=\"actions\"><button class=\"primary\" onclick=\"saveProvider()\">保存中转站</button><button onclick=\"resetForm()\">清空</button></div><p class=\"muted\">关闭面板不会清空未保存内容；再次点“添加中转站”会继续显示。</p></aside>
+<aside id=\"drawer\" class=\"drawer\"><div class=\"drawer-head\"><h2 id=\"formTitle\">添加中转站</h2><button class=\"ghost\" onclick=\"closeForm()\">关闭</button></div><label>ID</label><input id=\"providerId\" placeholder=\"my-relay\"><label>名称</label><input id=\"providerName\" placeholder=\"My Relay\"><label>协议</label><select id=\"protocol\"><option value=\"openai\">OpenAI-compatible</option><option value=\"anthropic\">Anthropic Messages</option><option value=\"gemini\">Gemini native</option></select><label>Base URL</label><input id=\"baseUrl\" placeholder=\"https://relay.example.com/v1\"><label>API key</label><input id=\"apiKey\" type=\"password\" placeholder=\"编辑时留空表示保留原 key\"><label>模型（每行一个）</label><textarea id=\"models\" placeholder=\"gpt-4.1&#10;gpt-image-2\"></textarea><div class=\"actions\"><button class=\"primary\" onclick=\"saveProvider()\">保存中转站</button><button onclick=\"resetForm()\">清空</button></div><p class=\"muted\">关闭面板不会清空未保存内容；再次点“添加中转站”会继续显示。</p></aside>
 <script>
 const AUTH_REQUIRED = {auth_hint};
 let state = null;
@@ -364,16 +427,17 @@ function esc(s) {{ return String(s ?? '').replace(/[&<>\"]/g, c=>({{'&':'&amp;',
 function saveProxyKey() {{ sessionStorage.setItem('gpt2cc_proxy_key', document.getElementById('proxyKey').value); load(); }}
 async function api(path, opts={{}}) {{ const r=await fetch(path, {{...opts, headers:{{...headers(), ...(opts.headers||{{}})}}}}); if(r.status===401) {{ document.getElementById('authBox').classList.add('show'); throw new Error('需要代理密钥'); }} const data=await r.json(); if(!r.ok) throw new Error(data.error?.message || '请求失败'); return data; }}
 async function load() {{ try {{ state=await api('/admin/state'); document.getElementById('authBox').classList.toggle('show', AUTH_REQUIRED && !key()); render(); }} catch(e) {{ show(e.message,'err'); }} }}
-function providerText(p) {{ return [p.id,p.name,p.upstream_base_url,...(p.models||[])].join(' ').toLowerCase(); }}
+function providerText(p) {{ return [p.id,p.name,p.protocol,p.upstream_base_url,...(p.models||[])].join(' ').toLowerCase(); }}
 function filteredProviders() {{ const q=(searchBox.value||'').trim().toLowerCase(); return !q ? state.providers : state.providers.filter(p=>providerText(p).includes(q)); }}
 function clearSearch() {{ searchBox.value=''; render(); }}
 function render() {{ const active=state.providers.find(p=>p.id===state.active_provider); activeTitle.textContent=(active?.name||state.active_provider)+' / '+state.active_model; configPath.textContent='配置文件：'+state.config_path; const items=filteredProviders(); providers.innerHTML=items.length ? items.map(p=>rowHtml(p)).join('') : '<div class="empty">没有匹配的中转站</div>'; }}
-function rowHtml(p) {{ const active=p.id===state.active_provider; const models=p.models||[]; const visible=models.slice(0,8).map(m=>`<button class="model ${{active&&m===state.active_model?'active-model':''}}" onclick="activateModel('${{esc(p.id)}}',decodeURIComponent('${{encodeURIComponent(m)}}'))">${{esc(m)}}</button>`).join('') || '<span class="muted">未配置模型</span>'; return `<div class="row ${{active?'active':''}}"><div><div class="name">${{esc(p.name)}}${{active?'<span class="pill">Active</span>':''}}</div><div class="sub">${{esc(p.id)}} · ${{p.has_api_key?'key 已保存':'未设置 key'}}</div></div><div class="sub">${{esc(p.upstream_base_url)}}</div><div class="models">${{visible}}${{models.length>8?`<span class="model">+${{models.length-8}}</span>`:''}}</div><div class="actions"><select id="sel-${{esc(p.id)}}">${{models.map(m=>`<option ${{m===state.active_model?'selected':''}}>${{esc(m)}}</option>`).join('')}}</select><button class="primary" onclick="activate('${{esc(p.id)}}')">切换</button><button onclick="editProvider('${{esc(p.id)}}')">编辑</button><button class="danger" onclick="deleteProvider('${{esc(p.id)}}')">删除</button></div></div>`; }}
+function protocolName(protocol) {{ return ({{openai:'OpenAI',anthropic:'Anthropic',gemini:'Gemini'}})[protocol||'openai'] || protocol || 'OpenAI'; }}
+function rowHtml(p) {{ const active=p.id===state.active_provider; const protocol=p.protocol||'openai'; const models=p.models||[]; const visible=models.map(m=>`<button class="model ${{active&&m===state.active_model?'active-model':''}}" onclick="activateModel('${{esc(p.id)}}',decodeURIComponent('${{encodeURIComponent(m)}}'))">${{esc(m)}}</button>`).join('') || '<span class="muted">未配置模型</span>'; return `<div class="row ${{active?'active':''}}"><div><div class="name">${{esc(p.name)}}<span class="protocol">${{esc(protocolName(protocol))}}</span>${{active?'<span class="pill">Active</span>':''}}</div><div class="sub">${{esc(p.id)}} · ${{p.has_api_key?'key 已保存':'未设置 key'}}</div></div><div class="sub">${{esc(p.upstream_base_url)}}</div><div class="models">${{visible}}</div><div class="actions"><select id="sel-${{esc(p.id)}}">${{models.map(m=>`<option ${{m===state.active_model?'selected':''}}>${{esc(m)}}</option>`).join('')}}</select><button class="primary" onclick="activate('${{esc(p.id)}}')">切换</button><button onclick="editProvider('${{esc(p.id)}}')">编辑</button><button class="danger" onclick="deleteProvider('${{esc(p.id)}}')">删除</button></div></div>`; }}
 function openForm() {{ drawer.classList.add('show'); drawerBackdrop.classList.add('show'); }}
 function closeForm() {{ drawer.classList.remove('show'); drawerBackdrop.classList.remove('show'); }}
-function editProvider(id) {{ const p=state.providers.find(x=>x.id===id); if(!p) return; formTitle.textContent='编辑中转站'; providerId.value=p.id; providerName.value=p.name; baseUrl.value=p.upstream_base_url; apiKey.value=''; models.value=(p.models||[]).join('\\n'); openForm(); }}
-function resetForm() {{ formTitle.textContent='添加中转站'; providerId.value=''; providerName.value=''; baseUrl.value=''; apiKey.value=''; models.value=''; }}
-async function saveProvider() {{ try {{ await api('/admin/providers', {{method:'POST', body:JSON.stringify({{id:providerId.value,name:providerName.value,upstream_base_url:baseUrl.value,upstream_api_key:apiKey.value,models:models.value.split(/\\n+/).map(x=>x.trim()).filter(Boolean)}})}}); resetForm(); closeForm(); await load(); show('中转站已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
+function editProvider(id) {{ const p=state.providers.find(x=>x.id===id); if(!p) return; formTitle.textContent='编辑中转站'; providerId.value=p.id; providerName.value=p.name; protocol.value=p.protocol||'openai'; baseUrl.value=p.upstream_base_url; apiKey.value=''; models.value=(p.models||[]).join('\\n'); openForm(); }}
+function resetForm() {{ formTitle.textContent='添加中转站'; providerId.value=''; providerName.value=''; protocol.value='openai'; baseUrl.value=''; apiKey.value=''; models.value=''; }}
+async function saveProvider() {{ try {{ await api('/admin/providers', {{method:'POST', body:JSON.stringify({{id:providerId.value,name:providerName.value,protocol:protocol.value,upstream_base_url:baseUrl.value,upstream_api_key:apiKey.value,models:models.value.split(/\\n+/).map(x=>x.trim()).filter(Boolean)}})}}); resetForm(); closeForm(); await load(); show('中转站已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function activate(id) {{ try {{ const sel=document.getElementById('sel-'+id); await activateModel(id, sel?.value||''); }} catch(e) {{ show(e.message,'err'); }} }}
 async function activateModel(id, model) {{ try {{ await api('/admin/active', {{method:'POST', body:JSON.stringify({{provider_id:id, model}})}}); await load(); show('已切换，新的请求会立即使用该配置'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function deleteProvider(id) {{ if(!confirm('删除这个中转站？')) return; try {{ await api('/admin/providers/delete', {{method:'POST', body:JSON.stringify({{id}})}}); await load(); show('中转站已删除'); }} catch(e) {{ show(e.message,'err'); }} }}
@@ -398,13 +462,39 @@ def status_from_upstream(status: int) -> HTTPStatus:
     return HTTPStatus.INTERNAL_SERVER_ERROR
 
 
-def run(config: Config) -> None:
+def admin_url(config: Config) -> str:
+    host = config.host.strip() or "localhost"
+    if host in {"127.0.0.1", "0.0.0.0", "::", "[::]"}:
+        host = "localhost"
+    if ":" in host and not host.startswith("[") and host != "localhost":
+        host = f"[{host}]"
+    return f"http://{host}:{config.port}/admin"
+
+
+def should_open_admin(cli_no_open: bool) -> bool:
+    if cli_no_open:
+        return False
+    value = os.getenv("GPT2CC_OPEN_ADMIN") or os.getenv("CCPROXY_OPEN_ADMIN")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "n", "off"}
+
+
+def run(config: Config, open_admin: bool = True) -> None:
     server = ReusableThreadingHTTPServer((config.host, config.port), make_handler(config))
+    url = admin_url(config)
     LOG.info("gpt2cc %s listening on http://%s:%s", __version__, config.host, config.port)
-    LOG.info("admin console: http://%s:%s/admin", config.host, config.port)
+    LOG.info("admin console: %s", url)
+    LOG.info("config file: %s", config.config_path)
+    LOG.info("upstream protocol: %s", config.upstream_protocol)
     LOG.info("upstream chat endpoint: %s", config.upstream_chat_url)
     LOG.info("upstream images endpoint: %s", config.upstream_images_generations_url)
     LOG.info("upstream image edits endpoint: %s", config.upstream_images_edits_url)
+    if open_admin:
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            LOG.warning("could not open admin console automatically: %s", exc)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -417,6 +507,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Anthropic Messages API proxy for Claude Code.")
     parser.add_argument("--host", help="listen host; overrides GPT2CC_HOST")
     parser.add_argument("--port", type=int, help="listen port; overrides GPT2CC_PORT")
+    parser.add_argument("--no-open-admin", action="store_true", help="do not open the admin console in a browser")
     args = parser.parse_args()
 
     config = load_config()
@@ -425,7 +516,11 @@ def main() -> None:
     if args.port:
         config.port = args.port
 
-    run(config)
+    created_config = ensure_config_file(config)
+    if created_config:
+        LOG.info("created config file: %s", config.config_path)
+
+    run(config, open_admin=should_open_admin(args.no_open_admin))
 
 
 if __name__ == "__main__":
