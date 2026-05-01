@@ -94,6 +94,64 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(relay["upstream_api_key"], "***")
         self.assertTrue(relay["has_api_key"])
         self.assertEqual(store.snapshot().providers[-1]["upstream_api_key"], "sk-secret")
+    def test_config_store_state_places_active_provider_first(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "active_provider": "relay1",
+                        "active_model": "gpt-4.1",
+                        "providers": [
+                            {
+                                "id": "relay1",
+                                "name": "Relay 1",
+                                "upstream_base_url": "https://relay1.example/v1",
+                                "upstream_api_key": "sk-relay1",
+                                "models": ["gpt-4.1"],
+                            },
+                            {
+                                "id": "relay2",
+                                "name": "Relay 2",
+                                "upstream_base_url": "https://relay2.example/v1",
+                                "upstream_api_key": "sk-relay2",
+                                "models": ["gpt-image-2"],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                store = ConfigStore(load_config())
+                state = store.set_active("relay2", "gpt-image-2")
+        self.assertEqual(state["providers"][0]["id"], "relay2")
+        self.assertEqual(state["active_model"], "gpt-image-2")
+
+    def test_active_provider_label_uses_name_and_id(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "active_provider": "relay1",
+                        "active_model": "gpt-4.1",
+                        "providers": [
+                            {
+                                "id": "relay1",
+                                "name": "Main Relay",
+                                "upstream_base_url": "https://relay1.example/v1",
+                                "upstream_api_key": "sk-relay1",
+                                "models": ["gpt-4.1"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                config = load_config()
+        self.assertEqual(config.active_provider_label(), "Main Relay (relay1)")
 
 
 if __name__ == "__main__":

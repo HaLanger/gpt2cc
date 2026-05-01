@@ -148,13 +148,14 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 has_references = request_has_reference_images(request, request_config)
                 endpoint = "images/edits" if has_references else "images/generations"
                 LOG.info(
-                    "model route: requested=%s upstream=%s endpoint=%s stream=%s tools_ignored=%s references=%s",
+                    "model route: requested=%s upstream=%s endpoint=%s stream=%s tools_ignored=%s references=%s provider=%s",
                     ctx.requested_model or "<empty>",
                     ctx.upstream_model,
                     endpoint,
                     upstream_payload.get("stream"),
                     len(upstream_payload.get("tools") or []),
                     has_references,
+                    request_config.active_provider_label(),
                 )
 
                 if has_references:
@@ -203,11 +204,12 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 return
 
             LOG.info(
-                "model route: requested=%s upstream=%s endpoint=chat/completions stream=%s tools=%s",
+                "model route: requested=%s upstream=%s endpoint=chat/completions stream=%s tools=%s provider=%s",
                 ctx.requested_model or "<empty>",
                 ctx.upstream_model,
                 upstream_payload.get("stream"),
                 len(upstream_payload.get("tools") or []),
+                request_config.active_provider_label(),
             )
             if request_config.debug_payloads:
                 safe_payload = dict(upstream_payload)
@@ -338,7 +340,7 @@ input,textarea,select {{ width:100%; border:1px solid var(--line); border-radius
 button {{ border:0; border-radius:12px; padding:10px 13px; font-weight:750; cursor:pointer; background:#e8eefc; color:#1e3a8a; white-space:nowrap; }} button.primary {{ background:var(--brand); color:white; }} button.danger {{ background:#fee2e2; color:#991b1b; }} button.ghost {{ background:#f8fafc; color:#334155; border:1px solid var(--line); }} button:hover {{ filter:brightness(.97); }}
 .banner {{ display:none; margin-bottom:14px; padding:11px 13px; border-radius:14px; font-weight:700; }} .banner.ok {{ display:block; background:#dcfce7; color:#166534; }} .banner.err {{ display:block; background:#fee2e2; color:#991b1b; }} .auth {{ display:none; margin-bottom:14px; }} .auth.show {{ display:block; }}
 .list {{ display:grid; gap:8px; }} .row {{ display:grid; grid-template-columns:1.35fr 1.2fr .9fr auto; gap:12px; align-items:center; padding:12px; border:1px solid var(--line); background:white; border-radius:16px; }} .row.active {{ border-color:#93c5fd; box-shadow:0 10px 30px rgba(37,99,235,.10); }}
-.name {{ font-weight:800; }} .sub {{ color:var(--muted); font-size:12px; margin-top:3px; word-break:break-all; }} .models {{ display:flex; flex-wrap:wrap; gap:5px; max-height:52px; overflow:hidden; }} .model {{ border:1px solid var(--line); background:#f8fafc; border-radius:999px; padding:4px 8px; font-size:12px; }} .pill {{ border-radius:999px; padding:4px 9px; background:#eef2ff; color:#1d4ed8; font-size:12px; font-weight:800; display:inline-block; margin-left:6px; }} .actions {{ display:flex; gap:7px; justify-content:flex-end; flex-wrap:wrap; }} .empty {{ text-align:center; color:var(--muted); padding:32px; }}
+.name {{ font-weight:800; }} .sub {{ color:var(--muted); font-size:12px; margin-top:3px; word-break:break-all; }} .models {{ display:flex; flex-wrap:wrap; gap:5px; max-height:52px; overflow:hidden; }} .model {{ border:1px solid var(--line); background:#f8fafc; border-radius:999px; padding:4px 8px; font-size:12px; }} button.model {{ color:#334155; font-weight:750; }} button.model.active-model {{ background:#dbeafe; border-color:#93c5fd; color:#1d4ed8; }} .pill {{ border-radius:999px; padding:4px 9px; background:#eef2ff; color:#1d4ed8; font-size:12px; font-weight:800; display:inline-block; margin-left:6px; }} .actions {{ display:flex; gap:7px; justify-content:flex-end; flex-wrap:wrap; }} .empty {{ text-align:center; color:var(--muted); padding:32px; }}
 .drawer-backdrop {{ position:fixed; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:.18s; }} .drawer-backdrop.show {{ opacity:1; pointer-events:auto; }} .drawer {{ position:fixed; top:18px; right:18px; bottom:18px; width:min(460px,calc(100vw - 36px)); padding:20px; overflow:auto; transform:translateX(calc(100% + 28px)); transition:.2s; }} .drawer.show {{ transform:translateX(0); }} .drawer-head {{ display:flex; justify-content:space-between; align-items:center; gap:12px; }} .drawer h2 {{ margin:0; }} label {{ display:block; color:#334155; font-size:13px; font-weight:750; margin:13px 0 6px; }}
 @media (max-width:900px) {{ .hero,.toolbar,.row {{ grid-template-columns:1fr; }} .actions {{ justify-content:flex-start; }} }}
 </style>
@@ -366,13 +368,14 @@ function providerText(p) {{ return [p.id,p.name,p.upstream_base_url,...(p.models
 function filteredProviders() {{ const q=(searchBox.value||'').trim().toLowerCase(); return !q ? state.providers : state.providers.filter(p=>providerText(p).includes(q)); }}
 function clearSearch() {{ searchBox.value=''; render(); }}
 function render() {{ const active=state.providers.find(p=>p.id===state.active_provider); activeTitle.textContent=(active?.name||state.active_provider)+' / '+state.active_model; configPath.textContent='配置文件：'+state.config_path; const items=filteredProviders(); providers.innerHTML=items.length ? items.map(p=>rowHtml(p)).join('') : '<div class="empty">没有匹配的中转站</div>'; }}
-function rowHtml(p) {{ const active=p.id===state.active_provider; return `<div class="row ${{active?'active':''}}"><div><div class="name">${{esc(p.name)}}${{active?'<span class="pill">Active</span>':''}}</div><div class="sub">${{esc(p.id)}} · ${{p.has_api_key?'key 已保存':'未设置 key'}}</div></div><div class="sub">${{esc(p.upstream_base_url)}}</div><div class="models">${{(p.models||[]).slice(0,8).map(m=>`<span class="model">${{esc(m)}}</span>`).join('')||'<span class="muted">未配置模型</span>'}}${{(p.models||[]).length>8?`<span class="model">+${{p.models.length-8}}</span>`:''}}</div><div class="actions"><select id="sel-${{esc(p.id)}}">${{(p.models||[]).map(m=>`<option ${{m===state.active_model?'selected':''}}>${{esc(m)}}</option>`).join('')}}</select><button class="primary" onclick="activate('${{esc(p.id)}}')">切换</button><button onclick="editProvider('${{esc(p.id)}}')">编辑</button><button class="danger" onclick="deleteProvider('${{esc(p.id)}}')">删除</button></div></div>`; }}
+function rowHtml(p) {{ const active=p.id===state.active_provider; const models=p.models||[]; const visible=models.slice(0,8).map(m=>`<button class="model ${{active&&m===state.active_model?'active-model':''}}" onclick="activateModel('${{esc(p.id)}}',decodeURIComponent('${{encodeURIComponent(m)}}'))">${{esc(m)}}</button>`).join('') || '<span class="muted">未配置模型</span>'; return `<div class="row ${{active?'active':''}}"><div><div class="name">${{esc(p.name)}}${{active?'<span class="pill">Active</span>':''}}</div><div class="sub">${{esc(p.id)}} · ${{p.has_api_key?'key 已保存':'未设置 key'}}</div></div><div class="sub">${{esc(p.upstream_base_url)}}</div><div class="models">${{visible}}${{models.length>8?`<span class="model">+${{models.length-8}}</span>`:''}}</div><div class="actions"><select id="sel-${{esc(p.id)}}">${{models.map(m=>`<option ${{m===state.active_model?'selected':''}}>${{esc(m)}}</option>`).join('')}}</select><button class="primary" onclick="activate('${{esc(p.id)}}')">切换</button><button onclick="editProvider('${{esc(p.id)}}')">编辑</button><button class="danger" onclick="deleteProvider('${{esc(p.id)}}')">删除</button></div></div>`; }}
 function openForm() {{ drawer.classList.add('show'); drawerBackdrop.classList.add('show'); }}
 function closeForm() {{ drawer.classList.remove('show'); drawerBackdrop.classList.remove('show'); }}
 function editProvider(id) {{ const p=state.providers.find(x=>x.id===id); if(!p) return; formTitle.textContent='编辑中转站'; providerId.value=p.id; providerName.value=p.name; baseUrl.value=p.upstream_base_url; apiKey.value=''; models.value=(p.models||[]).join('\\n'); openForm(); }}
 function resetForm() {{ formTitle.textContent='添加中转站'; providerId.value=''; providerName.value=''; baseUrl.value=''; apiKey.value=''; models.value=''; }}
 async function saveProvider() {{ try {{ await api('/admin/providers', {{method:'POST', body:JSON.stringify({{id:providerId.value,name:providerName.value,upstream_base_url:baseUrl.value,upstream_api_key:apiKey.value,models:models.value.split(/\\n+/).map(x=>x.trim()).filter(Boolean)}})}}); resetForm(); closeForm(); await load(); show('中转站已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
-async function activate(id) {{ try {{ const sel=document.getElementById('sel-'+id); await api('/admin/active', {{method:'POST', body:JSON.stringify({{provider_id:id, model:sel?.value||''}})}}); await load(); show('已切换，新的请求会立即使用该配置'); }} catch(e) {{ show(e.message,'err'); }} }}
+async function activate(id) {{ try {{ const sel=document.getElementById('sel-'+id); await activateModel(id, sel?.value||''); }} catch(e) {{ show(e.message,'err'); }} }}
+async function activateModel(id, model) {{ try {{ await api('/admin/active', {{method:'POST', body:JSON.stringify({{provider_id:id, model}})}}); await load(); show('已切换，新的请求会立即使用该配置'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function deleteProvider(id) {{ if(!confirm('删除这个中转站？')) return; try {{ await api('/admin/providers/delete', {{method:'POST', body:JSON.stringify({{id}})}}); await load(); show('中转站已删除'); }} catch(e) {{ show(e.message,'err'); }} }}
 load();
 </script>

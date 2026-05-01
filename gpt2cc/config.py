@@ -192,6 +192,16 @@ class Config:
     active_model: str = ""
     config_path: str = DEFAULT_CONFIG_PATH
 
+    def active_provider_label(self) -> str:
+        provider = next((p for p in self.providers if p.get("id") == self.active_provider), None)
+        if not provider:
+            return self.active_provider or "<none>"
+        name = str(provider.get("name") or provider.get("id") or "").strip()
+        provider_id = str(provider.get("id") or "").strip()
+        if name and provider_id and name != provider_id:
+            return f"{name} ({provider_id})"
+        return name or provider_id or "<none>"
+
     @property
     def upstream_chat_url(self) -> str:
         base = self.upstream_base_url.rstrip("/")
@@ -379,10 +389,12 @@ class ConfigStore:
 
     def state(self) -> dict[str, Any]:
         with self._lock:
+            providers = redacted_providers(self._config.providers)
+            providers.sort(key=lambda provider: provider.get("id") != self._config.active_provider)
             return {
                 "active_provider": self._config.active_provider,
                 "active_model": self._config.active_model or self._config.model,
-                "providers": redacted_providers(self._config.providers),
+                "providers": providers,
                 "config_path": self._config.config_path,
                 "auth_required": bool(self._config.proxy_api_key),
             }
