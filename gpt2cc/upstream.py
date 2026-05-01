@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import ssl
@@ -53,7 +54,7 @@ def build_ssl_context(config: Config) -> ssl.SSLContext:
 def build_headers(config: Config, stream: bool = False, content_type: str = "application/json") -> dict[str, str]:
     headers = {
         "Accept": "text/event-stream" if stream else "application/json",
-        "User-Agent": "ccproxy/0.1.0",
+        "User-Agent": "gpt2cc/0.1.0",
     }
     if content_type:
         headers["Content-Type"] = content_type
@@ -96,11 +97,17 @@ def post_json_url(config: Config, url: str, payload: dict[str, Any]) -> Upstream
         except urllib.error.HTTPError as exc:
             data = exc.read()
             raise UpstreamError(exc.code, decode_error(data) or exc.reason, data) from exc
+        except http.client.IncompleteRead as exc:
+            last_error = UpstreamError(
+                502,
+                format_incomplete_read(exc),
+                exc.partial,
+            )
         except urllib.error.URLError as exc:
             last_error = UpstreamError(502, format_url_error(exc))
         except ssl.SSLError as exc:
             last_error = UpstreamError(502, format_ssl_error(exc))
-        except TimeoutError as exc:
+        except TimeoutError:
             last_error = UpstreamError(504, "upstream request timed out")
 
         if attempt < config.max_retries:
@@ -116,7 +123,7 @@ def post_multipart_url(
     fields: dict[str, str],
     files: list[MultipartFile],
 ) -> UpstreamResponse:
-    boundary = f"ccproxy-{uuid.uuid4().hex}"
+    boundary = f"gpt2cc-{uuid.uuid4().hex}"
     body = encode_multipart(fields, files, boundary)
     last_error: UpstreamError | None = None
     ssl_context = build_ssl_context(config)
@@ -130,11 +137,17 @@ def post_multipart_url(
         except urllib.error.HTTPError as exc:
             data = exc.read()
             raise UpstreamError(exc.code, decode_error(data) or exc.reason, data) from exc
+        except http.client.IncompleteRead as exc:
+            last_error = UpstreamError(
+                502,
+                format_incomplete_read(exc),
+                exc.partial,
+            )
         except urllib.error.URLError as exc:
             last_error = UpstreamError(502, format_url_error(exc))
         except ssl.SSLError as exc:
             last_error = UpstreamError(502, format_ssl_error(exc))
-        except TimeoutError as exc:
+        except TimeoutError:
             last_error = UpstreamError(504, "upstream request timed out")
 
         if attempt < config.max_retries:
@@ -231,6 +244,16 @@ def decode_error(data: bytes) -> str:
     return json.dumps(value, ensure_ascii=False)[:4000]
 
 
+def format_incomplete_read(exc: http.client.IncompleteRead) -> str:
+    expected = getattr(exc, "expected", None)
+    if expected is None:
+        return f"upstream response ended before the full body was received: {len(exc.partial)} bytes read"
+    return (
+        "upstream response ended before the full body was received: "
+        f"{len(exc.partial)} bytes read, {expected} more expected"
+    )
+
+
 def format_url_error(exc: urllib.error.URLError) -> str:
     reason = exc.reason
     if isinstance(reason, ssl.SSLError):
@@ -244,6 +267,6 @@ def format_ssl_error(exc: ssl.SSLError) -> str:
         return message
     return (
         f"{message}. The upstream HTTPS certificate chain is not trusted by this Python runtime. "
-        "Prefer setting CCPROXY_UPSTREAM_CA_BUNDLE to a PEM file containing the missing root/intermediate CA. "
-        "For temporary local troubleshooting only, set CCPROXY_UPSTREAM_SSL_VERIFY=false and restart ccproxy."
+        "Prefer setting GPT2CC_UPSTREAM_CA_BUNDLE to a PEM file containing the missing root/intermediate CA. "
+        "For temporary local troubleshooting only, set GPT2CC_UPSTREAM_SSL_VERIFY=false and restart gpt2cc."
     )

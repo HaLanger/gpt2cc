@@ -30,7 +30,7 @@ LOG = logging.getLogger(__name__)
 
 def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = f"ccproxy/{__version__}"
+        server_version = f"gpt2cc/{__version__}"
         protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -48,7 +48,7 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                     self._send_json(
                         {
                             "ok": True,
-                            "name": "ccproxy",
+                            "name": "gpt2cc",
                             "version": __version__,
                             "anthropic_compatible": True,
                             "upstream": config.upstream_base_url,
@@ -287,7 +287,7 @@ def status_from_upstream(status: int) -> HTTPStatus:
 
 def run(config: Config) -> None:
     server = ReusableThreadingHTTPServer((config.host, config.port), make_handler(config))
-    LOG.info("ccproxy %s listening on http://%s:%s", __version__, config.host, config.port)
+    LOG.info("gpt2cc %s listening on http://%s:%s", __version__, config.host, config.port)
     LOG.info("upstream chat endpoint: %s", config.upstream_chat_url)
     LOG.info("upstream images endpoint: %s", config.upstream_images_generations_url)
     LOG.info("upstream image edits endpoint: %s", config.upstream_images_edits_url)
@@ -301,8 +301,8 @@ def run(config: Config) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Anthropic Messages API proxy for Claude Code.")
-    parser.add_argument("--host", help="listen host; overrides CCPROXY_HOST")
-    parser.add_argument("--port", type=int, help="listen port; overrides CCPROXY_PORT")
+    parser.add_argument("--host", help="listen host; overrides GPT2CC_HOST")
+    parser.add_argument("--port", type=int, help="listen port; overrides GPT2CC_PORT")
     args = parser.parse_args()
 
     config = load_config()

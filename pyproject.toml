@@ -1,12 +1,15 @@
 [project]
-name = "ccproxy"
+name = "gpt2cc"
 version = "0.1.0"
-description = "Anthropic Messages API proxy for Claude Code backed by OpenAI-compatible Codex relay APIs."
+description = "Anthropic Messages API proxy for Claude Code backed by OpenAI-compatible GPT and image APIs."
 requires-python = ">=3.10"
+license = "MIT"
+readme = "README.md"
 dependencies = []
 
 [project.scripts]
-ccproxy = "ccproxy.server:main"
+gpt2cc = "gpt2cc.server:main"
+ccproxy = "gpt2cc.server:main"
 
 [build-system]
 requires = ["setuptools>=68"]

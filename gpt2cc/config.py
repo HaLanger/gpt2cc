@@ -112,21 +112,30 @@ def parse_list_value(value: Any) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _env_value(env_name: str) -> str | None:
+    value = os.getenv(env_name)
+    if value is not None:
+        return value
+    if env_name.startswith("GPT2CC_"):
+        return os.getenv("CCPROXY_" + env_name.removeprefix("GPT2CC_"))
+    return None
+
+
 def _load_json_config() -> dict[str, Any]:
-    path = os.getenv("CCPROXY_CONFIG")
+    path = _env_value("GPT2CC_CONFIG")
     if not path:
         return {}
     config_path = Path(path)
     if not config_path.exists():
-        raise FileNotFoundError(f"CCPROXY_CONFIG does not exist: {config_path}")
+        raise FileNotFoundError(f"GPT2CC_CONFIG/CCPROXY_CONFIG does not exist: {config_path}")
     data = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError("CCPROXY_CONFIG must contain a JSON object")
+        raise ValueError("GPT2CC_CONFIG/CCPROXY_CONFIG must contain a JSON object")
     return data
 
 
 def _cfg(data: dict[str, Any], key: str, env_name: str, default: Any = None) -> Any:
-    env_value = os.getenv(env_name)
+    env_value = _env_value(env_name)
     if env_value is not None:
         return env_value
     return data.get(key, default)
@@ -262,81 +271,81 @@ def load_config() -> Config:
     file_config = _load_json_config()
 
     config = Config(
-        host=str(_cfg(file_config, "host", "CCPROXY_HOST", "127.0.0.1")),
-        port=int(_cfg(file_config, "port", "CCPROXY_PORT", 3456)),
+        host=str(_cfg(file_config, "host", "GPT2CC_HOST", "127.0.0.1")),
+        port=int(_cfg(file_config, "port", "GPT2CC_PORT", 3456)),
         upstream_base_url=str(
             _cfg(
                 file_config,
                 "upstream_base_url",
-                "CCPROXY_UPSTREAM_BASE_URL",
+                "GPT2CC_UPSTREAM_BASE_URL",
                 "https://api.openai.com/v1",
             )
         ),
         upstream_chat_path=str(
-            _cfg(file_config, "upstream_chat_path", "CCPROXY_UPSTREAM_CHAT_PATH", "/chat/completions")
+            _cfg(file_config, "upstream_chat_path", "GPT2CC_UPSTREAM_CHAT_PATH", "/chat/completions")
         ),
         upstream_images_generations_path=str(
             _cfg(
                 file_config,
                 "upstream_images_generations_path",
-                "CCPROXY_UPSTREAM_IMAGES_GENERATIONS_PATH",
+                "GPT2CC_UPSTREAM_IMAGES_GENERATIONS_PATH",
                 "/images/generations",
             )
         ),
         upstream_images_edits_path=str(
-            _cfg(file_config, "upstream_images_edits_path", "CCPROXY_UPSTREAM_IMAGES_EDITS_PATH", "/images/edits")
+            _cfg(file_config, "upstream_images_edits_path", "GPT2CC_UPSTREAM_IMAGES_EDITS_PATH", "/images/edits")
         ),
-        upstream_api_key=str(_cfg(file_config, "upstream_api_key", "CCPROXY_UPSTREAM_API_KEY", "")),
+        upstream_api_key=str(_cfg(file_config, "upstream_api_key", "GPT2CC_UPSTREAM_API_KEY", "")),
         upstream_auth_header=str(
-            _cfg(file_config, "upstream_auth_header", "CCPROXY_UPSTREAM_AUTH_HEADER", "Authorization")
+            _cfg(file_config, "upstream_auth_header", "GPT2CC_UPSTREAM_AUTH_HEADER", "Authorization")
         ),
-        upstream_auth_scheme=str(_cfg(file_config, "upstream_auth_scheme", "CCPROXY_UPSTREAM_AUTH_SCHEME", "Bearer")),
+        upstream_auth_scheme=str(_cfg(file_config, "upstream_auth_scheme", "GPT2CC_UPSTREAM_AUTH_SCHEME", "Bearer")),
         upstream_ssl_verify=str(
-            _cfg(file_config, "upstream_ssl_verify", "CCPROXY_UPSTREAM_SSL_VERIFY", "true")
+            _cfg(file_config, "upstream_ssl_verify", "GPT2CC_UPSTREAM_SSL_VERIFY", "true")
         ).lower()
         in TRUTHY,
-        upstream_ca_bundle=str(_cfg(file_config, "upstream_ca_bundle", "CCPROXY_UPSTREAM_CA_BUNDLE", "")),
-        proxy_api_key=str(_cfg(file_config, "proxy_api_key", "CCPROXY_PROXY_API_KEY", "")),
-        model=str(_cfg(file_config, "model", "CCPROXY_UPSTREAM_MODEL", "")),
-        model_map=parse_map_value(_cfg(file_config, "model_map", "CCPROXY_MODEL_MAP", "")),
+        upstream_ca_bundle=str(_cfg(file_config, "upstream_ca_bundle", "GPT2CC_UPSTREAM_CA_BUNDLE", "")),
+        proxy_api_key=str(_cfg(file_config, "proxy_api_key", "GPT2CC_PROXY_API_KEY", "")),
+        model=str(_cfg(file_config, "model", "GPT2CC_UPSTREAM_MODEL", "")),
+        model_map=parse_map_value(_cfg(file_config, "model_map", "GPT2CC_MODEL_MAP", "")),
         pass_through_model=str(
-            _cfg(file_config, "pass_through_model", "CCPROXY_PASS_THROUGH_MODEL", "false")
+            _cfg(file_config, "pass_through_model", "GPT2CC_PASS_THROUGH_MODEL", "false")
         ).lower()
         in TRUTHY,
-        timeout_seconds=float(_cfg(file_config, "timeout_seconds", "CCPROXY_TIMEOUT_SECONDS", 600.0)),
-        max_retries=int(_cfg(file_config, "max_retries", "CCPROXY_MAX_RETRIES", 1)),
-        max_body_bytes=int(_cfg(file_config, "max_body_bytes", "CCPROXY_MAX_BODY_BYTES", 25 * 1024 * 1024)),
-        log_level=str(_cfg(file_config, "log_level", "CCPROXY_LOG_LEVEL", "INFO")),
-        debug_payloads=str(_cfg(file_config, "debug_payloads", "CCPROXY_DEBUG_PAYLOADS", "false")).lower()
+        timeout_seconds=float(_cfg(file_config, "timeout_seconds", "GPT2CC_TIMEOUT_SECONDS", 600.0)),
+        max_retries=int(_cfg(file_config, "max_retries", "GPT2CC_MAX_RETRIES", 1)),
+        max_body_bytes=int(_cfg(file_config, "max_body_bytes", "GPT2CC_MAX_BODY_BYTES", 25 * 1024 * 1024)),
+        log_level=str(_cfg(file_config, "log_level", "GPT2CC_LOG_LEVEL", "INFO")),
+        debug_payloads=str(_cfg(file_config, "debug_payloads", "GPT2CC_DEBUG_PAYLOADS", "false")).lower()
         in TRUTHY,
-        cors=str(_cfg(file_config, "cors", "CCPROXY_CORS", "true")).lower() in TRUTHY,
+        cors=str(_cfg(file_config, "cors", "GPT2CC_CORS", "true")).lower() in TRUTHY,
         stream_include_usage=str(
-            _cfg(file_config, "stream_include_usage", "CCPROXY_STREAM_INCLUDE_USAGE", "true")
+            _cfg(file_config, "stream_include_usage", "GPT2CC_STREAM_INCLUDE_USAGE", "true")
         ).lower()
         in TRUTHY,
         retry_without_stream_options=str(
-            _cfg(file_config, "retry_without_stream_options", "CCPROXY_RETRY_WITHOUT_STREAM_OPTIONS", "true")
+            _cfg(file_config, "retry_without_stream_options", "GPT2CC_RETRY_WITHOUT_STREAM_OPTIONS", "true")
         ).lower()
         in TRUTHY,
-        max_tokens_field=str(_cfg(file_config, "max_tokens_field", "CCPROXY_MAX_TOKENS_FIELD", "max_tokens")),
-        omit_temperature=str(_cfg(file_config, "omit_temperature", "CCPROXY_OMIT_TEMPERATURE", "false")).lower()
+        max_tokens_field=str(_cfg(file_config, "max_tokens_field", "GPT2CC_MAX_TOKENS_FIELD", "max_tokens")),
+        omit_temperature=str(_cfg(file_config, "omit_temperature", "GPT2CC_OMIT_TEMPERATURE", "false")).lower()
         in TRUTHY,
-        omit_top_p=str(_cfg(file_config, "omit_top_p", "CCPROXY_OMIT_TOP_P", "false")).lower() in TRUTHY,
-        force_stream=str(_cfg(file_config, "force_stream", "CCPROXY_FORCE_STREAM", "false")).lower() in TRUTHY,
-        extra_headers=parse_object_value(_cfg(file_config, "extra_headers", "CCPROXY_UPSTREAM_EXTRA_HEADERS", "")),
+        omit_top_p=str(_cfg(file_config, "omit_top_p", "GPT2CC_OMIT_TOP_P", "false")).lower() in TRUTHY,
+        force_stream=str(_cfg(file_config, "force_stream", "GPT2CC_FORCE_STREAM", "false")).lower() in TRUTHY,
+        extra_headers=parse_object_value(_cfg(file_config, "extra_headers", "GPT2CC_UPSTREAM_EXTRA_HEADERS", "")),
         image_models=parse_list_value(
-            _cfg(file_config, "image_models", "CCPROXY_IMAGE_MODELS", "gpt-image-*,dall-e-3,dall-e-2")
+            _cfg(file_config, "image_models", "GPT2CC_IMAGE_MODELS", "gpt-image-*,dall-e-3,dall-e-2")
         ),
-        image_output_dir=str(_cfg(file_config, "image_output_dir", "CCPROXY_IMAGE_OUTPUT_DIR", "generated-images")),
-        image_size=str(_cfg(file_config, "image_size", "CCPROXY_IMAGE_SIZE", "auto")),
-        image_quality=str(_cfg(file_config, "image_quality", "CCPROXY_IMAGE_QUALITY", "auto")),
-        image_background=str(_cfg(file_config, "image_background", "CCPROXY_IMAGE_BACKGROUND", "auto")),
-        image_output_format=str(_cfg(file_config, "image_output_format", "CCPROXY_IMAGE_OUTPUT_FORMAT", "png")),
-        image_n=int(_cfg(file_config, "image_n", "CCPROXY_IMAGE_N", 1)),
-        image_moderation=str(_cfg(file_config, "image_moderation", "CCPROXY_IMAGE_MODERATION", "")),
-        image_input_fidelity=str(_cfg(file_config, "image_input_fidelity", "CCPROXY_IMAGE_INPUT_FIDELITY", "")),
+        image_output_dir=str(_cfg(file_config, "image_output_dir", "GPT2CC_IMAGE_OUTPUT_DIR", "generated-images")),
+        image_size=str(_cfg(file_config, "image_size", "GPT2CC_IMAGE_SIZE", "auto")),
+        image_quality=str(_cfg(file_config, "image_quality", "GPT2CC_IMAGE_QUALITY", "auto")),
+        image_background=str(_cfg(file_config, "image_background", "GPT2CC_IMAGE_BACKGROUND", "auto")),
+        image_output_format=str(_cfg(file_config, "image_output_format", "GPT2CC_IMAGE_OUTPUT_FORMAT", "png")),
+        image_n=int(_cfg(file_config, "image_n", "GPT2CC_IMAGE_N", 1)),
+        image_moderation=str(_cfg(file_config, "image_moderation", "GPT2CC_IMAGE_MODERATION", "")),
+        image_input_fidelity=str(_cfg(file_config, "image_input_fidelity", "GPT2CC_IMAGE_INPUT_FIDELITY", "")),
         image_max_reference_images=int(
-            _cfg(file_config, "image_max_reference_images", "CCPROXY_IMAGE_MAX_REFERENCE_IMAGES", 16)
+            _cfg(file_config, "image_max_reference_images", "GPT2CC_IMAGE_MAX_REFERENCE_IMAGES", 16)
         ),
     )
 

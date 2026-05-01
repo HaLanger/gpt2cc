@@ -2,8 +2,8 @@ import io
 import json
 import unittest
 
-from ccproxy.streaming import stream_openai_to_anthropic
-from ccproxy.transform import TransformContext
+from gpt2cc.streaming import stream_openai_to_anthropic
+from gpt2cc.transform import TransformContext
 
 
 def sse(data):

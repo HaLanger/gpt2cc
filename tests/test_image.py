@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ccproxy.config import Config
-from ccproxy.image import (
+from gpt2cc.config import Config
+from gpt2cc.image import (
     build_image_edit_request,
     build_image_generation_payload,
     extract_reference_images,
@@ -12,7 +12,7 @@ from ccproxy.image import (
     is_image_model,
     request_has_reference_images,
 )
-from ccproxy.transform import TransformContext
+from gpt2cc.transform import TransformContext
 
 
 class ImageTests(unittest.TestCase):

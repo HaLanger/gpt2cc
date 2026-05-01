@@ -1,8 +1,8 @@
 import json
 import unittest
 
-from ccproxy.config import Config
-from ccproxy.transform import anthropic_message_from_openai, transform_anthropic_to_openai
+from gpt2cc.config import Config
+from gpt2cc.transform import anthropic_message_from_openai, transform_anthropic_to_openai
 
 
 class TransformTests(unittest.TestCase):
