@@ -3,6 +3,12 @@
   "port": 3456,
   "active_provider": "main-relay",
   "active_model": "gpt-4.1",
+  "model_routes": {
+    "claude-opus-4-7": {"provider": "main-relay", "model": "gpt-4.1"},
+    "claude-sonnet-4-6": {"provider": "main-relay", "model": "gpt-4.1"},
+    "claude-haiku-4-5-20251001": {"provider": "gemini-relay", "model": "gemini-2.5-flash"}
+  },
+  "primary_route_model": "claude-sonnet-4-6",
   "providers": [
     {
       "id": "main-relay",
@@ -32,7 +38,7 @@
       "protocol": "gemini",
       "upstream_base_url": "https://generativelanguage.googleapis.com/v1beta",
       "upstream_api_key": "your-gemini-key",
-      "models": ["gemini-2.5-pro"],
+      "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
       "upstream_gemini_generate_path": "/models/{model}:generateContent",
       "upstream_gemini_stream_path": "/models/{model}:streamGenerateContent"
     }

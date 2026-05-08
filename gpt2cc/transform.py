@@ -17,6 +17,7 @@ OPENAI_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 class TransformContext:
     requested_model: str
     upstream_model: str
+    route_source: str = "active"
     tool_name_to_upstream: dict[str, str] = field(default_factory=dict)
     tool_name_from_upstream: dict[str, str] = field(default_factory=dict)
 
@@ -47,8 +48,9 @@ class TransformContext:
 
 def transform_anthropic_to_openai(request: dict[str, Any], config: Config) -> tuple[dict[str, Any], TransformContext]:
     requested_model = str(request.get("model") or "")
-    upstream_model = config.resolve_model(requested_model)
-    ctx = TransformContext(requested_model=requested_model, upstream_model=upstream_model)
+    route = config.resolve_model_route(requested_model)
+    upstream_model = route.upstream
+    ctx = TransformContext(requested_model=requested_model, upstream_model=upstream_model, route_source=route.source)
 
     messages: list[dict[str, Any]] = []
     system_content = request.get("system")

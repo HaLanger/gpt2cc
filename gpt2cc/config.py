@@ -7,6 +7,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,54 @@ def parse_object_value(value: Any) -> dict[str, str]:
     return parse_jsonish_object(str(value))
 
 
+def parse_model_routes_value(value: Any) -> dict[str, dict[str, str]]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict):
+        raise ValueError("model_routes must be an object")
+    routes: dict[str, dict[str, str]] = {}
+    for requested, route in value.items():
+        requested_model = str(requested).strip()
+        if not requested_model:
+            continue
+        if not isinstance(route, dict):
+            raise ValueError("model route must be an object")
+        provider = str(route.get("provider") or route.get("provider_id") or "").strip()
+        model = str(route.get("model") or "").strip()
+        if provider and not PROVIDER_ID_RE.match(provider):
+            raise ValueError("model route provider id may only contain letters, numbers, dots, underscores, and dashes")
+        routes[requested_model] = {"provider": provider, "model": model}
+    return routes
+
+
+def parse_seen_models_value(value: Any) -> dict[str, dict[str, Any]]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict):
+        raise ValueError("seen_models must be an object")
+    seen: dict[str, dict[str, Any]] = {}
+    for model, info in value.items():
+        model_id = str(model).strip()
+        if not model_id:
+            continue
+        if not isinstance(info, dict):
+            continue
+        try:
+            count = int(info.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        seen[model_id] = {"count": max(0, count), "last_seen": str(info.get("last_seen") or "")}
+    return seen
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def parse_list_value(value: Any) -> list[str]:
     if value is None or value == "":
         return []
@@ -149,6 +198,13 @@ def _cfg(data: dict[str, Any], key: str, env_name: str, default: Any = None) -> 
 
 
 @dataclass(slots=True)
+class ModelRoute:
+    requested: str
+    upstream: str
+    source: str
+
+
+@dataclass(slots=True)
 class Config:
     host: str = "127.0.0.1"
     port: int = 3456
@@ -168,6 +224,10 @@ class Config:
     proxy_api_key: str = ""
     model: str = ""
     model_map: dict[str, str] = field(default_factory=dict)
+    model_routes: dict[str, dict[str, str]] = field(default_factory=dict)
+    primary_route_model: str = ""
+    route_source: str = "active"
+    seen_models: dict[str, dict[str, Any]] = field(default_factory=dict)
     pass_through_model: bool = False
     timeout_seconds: float = 600.0
     max_retries: int = 1
@@ -237,15 +297,20 @@ class Config:
             path = "/" + path
         return base + path
 
-    def resolve_model(self, requested: str | None) -> str:
+    def resolve_model_route(self, requested: str | None) -> ModelRoute:
         requested = requested or ""
+        if self.route_source == "model_routes" and self.model:
+            return ModelRoute(requested=requested, upstream=self.model, source="model_routes")
         if requested in self.model_map:
-            return self.model_map[requested]
+            return ModelRoute(requested=requested, upstream=self.model_map[requested], source="legacy_model_map")
         if self.model:
-            return self.model
+            return ModelRoute(requested=requested, upstream=self.model, source=self.route_source or "active")
         if self.pass_through_model and requested:
-            return requested
-        return requested or "gpt-4.1"
+            return ModelRoute(requested=requested, upstream=requested, source="passthrough")
+        return ModelRoute(requested=requested, upstream=requested or "gpt-4.1", source="default")
+
+    def resolve_model(self, requested: str | None) -> str:
+        return self.resolve_model_route(requested).upstream
 
     def redacted(self) -> dict[str, Any]:
         safe_extra_headers: dict[str, str] = {}
@@ -274,6 +339,10 @@ class Config:
             "proxy_api_key": "***" if self.proxy_api_key else "",
             "model": self.model,
             "model_map": self.model_map,
+            "model_routes": self.model_routes,
+            "primary_route_model": self.primary_route_model,
+            "route_source": self.route_source,
+            "seen_models": self.seen_models,
             "pass_through_model": self.pass_through_model,
             "timeout_seconds": self.timeout_seconds,
             "max_retries": self.max_retries,
@@ -413,6 +482,8 @@ def copy_config(config: Config) -> Config:
     return replace(
         config,
         model_map=dict(config.model_map),
+        model_routes=copy.deepcopy(config.model_routes),
+        seen_models=copy.deepcopy(config.seen_models),
         extra_headers=dict(config.extra_headers),
         image_models=list(config.image_models),
         providers=copy.deepcopy(config.providers),
@@ -428,6 +499,38 @@ class ConfigStore:
         with self._lock:
             return copy_config(self._config)
 
+    def snapshot_for_model(self, requested_model: str) -> Config:
+        with self._lock:
+            route = self._config.model_routes.get(requested_model)
+            if route:
+                provider_id = str(route.get("provider") or "")
+                model = str(route.get("model") or "")
+                provider = next((p for p in self._config.providers if p.get("id") == provider_id), None)
+                if provider:
+                    try:
+                        config = self._activate(self._config, provider_id, model)
+                    except ValueError:
+                        config = copy_config(self._config)
+                    else:
+                        return replace(copy_config(config), route_source="model_routes")
+            return copy_config(self._config)
+
+    def record_seen_model(self, requested_model: str) -> None:
+        requested_model = str(requested_model or "").strip()
+        if not requested_model:
+            return
+        with self._lock:
+            seen = copy.deepcopy(self._config.seen_models)
+            item = dict(seen.get(requested_model) or {})
+            item["count"] = int(item.get("count") or 0) + 1
+            item["last_seen"] = utc_now_iso()
+            seen[requested_model] = item
+            if len(seen) > 50:
+                ordered = sorted(seen.items(), key=lambda pair: str(pair[1].get("last_seen") or ""), reverse=True)
+                seen = dict(ordered[:50])
+            self._config = replace(self._config, seen_models=seen)
+            self.save()
+
     def state(self) -> dict[str, Any]:
         with self._lock:
             providers = redacted_providers(self._config.providers)
@@ -436,6 +539,9 @@ class ConfigStore:
                 "active_provider": self._config.active_provider,
                 "active_model": self._config.active_model or self._config.model,
                 "active_protocol": self._config.upstream_protocol,
+                "model_routes": copy.deepcopy(self._config.model_routes),
+                "primary_route_model": self._config.primary_route_model,
+                "seen_models": copy.deepcopy(self._config.seen_models),
                 "providers": providers,
                 "config_path": self._config.config_path,
                 "auth_required": bool(self._config.proxy_api_key),
@@ -476,9 +582,68 @@ class ConfigStore:
 
     def set_active(self, provider_id: str, model: str) -> dict[str, Any]:
         with self._lock:
-            self._config = self._activate(self._config, provider_id, model)
+            self._config = self._sync_primary_route(self._activate(self._config, provider_id, model))
             self.save()
             return self.state()
+
+    def set_model_route(self, requested_model: str, provider_id: str, model: str) -> dict[str, Any]:
+        requested_model = str(requested_model or "").strip()
+        provider_id = str(provider_id or "").strip()
+        model = str(model or "").strip()
+        if not requested_model:
+            raise ValueError("requested_model is required")
+        self._validate_route(provider_id, model)
+        with self._lock:
+            routes = copy.deepcopy(self._config.model_routes)
+            routes[requested_model] = {"provider": provider_id, "model": model}
+            self._config = replace(self._config, model_routes=routes)
+            self.save()
+            return self.state()
+
+    def delete_model_route(self, requested_model: str) -> dict[str, Any]:
+        requested_model = str(requested_model or "").strip()
+        if not requested_model:
+            raise ValueError("requested_model is required")
+        with self._lock:
+            routes = copy.deepcopy(self._config.model_routes)
+            routes.pop(requested_model, None)
+            self._config = replace(self._config, model_routes=routes)
+            self.save()
+            return self.state()
+
+    def bind_primary_route_model(self, requested_model: str) -> dict[str, Any]:
+        requested_model = str(requested_model or "").strip()
+        if not requested_model:
+            raise ValueError("requested_model is required")
+        with self._lock:
+            config = replace(self._config, primary_route_model=requested_model)
+            self._config = self._sync_primary_route(config)
+            self.save()
+            return self.state()
+
+    def unbind_primary_route_model(self) -> dict[str, Any]:
+        with self._lock:
+            self._config = replace(self._config, primary_route_model="")
+            self.save()
+            return self.state()
+
+    def _sync_primary_route(self, config: Config) -> Config:
+        requested_model = str(config.primary_route_model or "").strip()
+        if not requested_model:
+            return config
+        routes = copy.deepcopy(config.model_routes)
+        routes[requested_model] = {"provider": config.active_provider, "model": config.active_model or config.model}
+        return replace(config, model_routes=routes)
+
+    def _validate_route(self, provider_id: str, model: str) -> None:
+        provider = next((p for p in self._config.providers if p.get("id") == provider_id), None)
+        if not provider:
+            raise ValueError("provider not found")
+        models = [str(item) for item in provider.get("models") or []]
+        if not model:
+            raise ValueError("model is required")
+        if models and model not in models:
+            raise ValueError("model is not listed for this provider")
 
     def _activate(self, config: Config, provider_id: str, model: str) -> Config:
         provider = next((p for p in config.providers if p.get("id") == provider_id), None)
@@ -517,6 +682,9 @@ def config_to_json(config: Config) -> dict[str, Any]:
         "proxy_api_key": config.proxy_api_key,
         "model": config.model,
         "model_map": config.model_map,
+        "model_routes": copy.deepcopy(config.model_routes),
+        "seen_models": copy.deepcopy(config.seen_models),
+        "primary_route_model": config.primary_route_model,
         "pass_through_model": config.pass_through_model,
         "timeout_seconds": config.timeout_seconds,
         "max_retries": config.max_retries,
@@ -616,6 +784,9 @@ def load_config() -> Config:
         proxy_api_key=str(_cfg(file_config, "proxy_api_key", "GPT2CC_PROXY_API_KEY", "")),
         model=str(_cfg(file_config, "model", "GPT2CC_UPSTREAM_MODEL", "")),
         model_map=parse_map_value(_cfg(file_config, "model_map", "GPT2CC_MODEL_MAP", "")),
+        model_routes=parse_model_routes_value(file_config.get("model_routes")),
+        primary_route_model=str(file_config.get("primary_route_model") or ""),
+        seen_models=parse_seen_models_value(file_config.get("seen_models")),
         pass_through_model=str(
             _cfg(file_config, "pass_through_model", "GPT2CC_PASS_THROUGH_MODEL", "false")
         ).lower()

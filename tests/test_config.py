@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gpt2cc.config import ConfigStore, ensure_config_file, load_config, normalize_provider
+from gpt2cc.config import Config, ConfigStore, ensure_config_file, load_config, normalize_provider
 
 
 class ConfigTests(unittest.TestCase):
@@ -185,6 +185,100 @@ class ConfigTests(unittest.TestCase):
                 config_path.write_text('{"sentinel":true}\n', encoding="utf-8")
                 self.assertFalse(ensure_config_file(config))
                 self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), {"sentinel": True})
+    def test_model_routes_snapshot_selects_provider_without_changing_active(self):
+        config = Config(
+            model="gpt-4.1",
+            active_provider="main",
+            active_model="gpt-4.1",
+            providers=[
+                {
+                    "id": "main",
+                    "name": "Main",
+                    "protocol": "openai",
+                    "upstream_base_url": "https://main.example/v1",
+                    "upstream_api_key": "sk-main",
+                    "models": ["gpt-4.1"],
+                    "upstream_chat_path": "/chat/completions",
+                    "upstream_messages_path": "/messages",
+                    "upstream_gemini_generate_path": "/models/{model}:generateContent",
+                    "upstream_gemini_stream_path": "/models/{model}:streamGenerateContent",
+                    "upstream_images_generations_path": "/images/generations",
+                    "upstream_images_edits_path": "/images/edits",
+                    "upstream_auth_header": "Authorization",
+                    "upstream_auth_scheme": "Bearer",
+                },
+                {
+                    "id": "strong",
+                    "name": "Strong",
+                    "protocol": "gemini",
+                    "upstream_base_url": "https://gemini.example/v1beta",
+                    "upstream_api_key": "sk-strong",
+                    "models": ["gemini-2.5-pro"],
+                    "upstream_chat_path": "/chat/completions",
+                    "upstream_messages_path": "/messages",
+                    "upstream_gemini_generate_path": "/models/{model}:generateContent",
+                    "upstream_gemini_stream_path": "/models/{model}:streamGenerateContent",
+                    "upstream_images_generations_path": "/images/generations",
+                    "upstream_images_edits_path": "/images/edits",
+                    "upstream_auth_header": "Authorization",
+                    "upstream_auth_scheme": "Bearer",
+                },
+            ],
+            model_routes={"claude-opus-4-7": {"provider": "strong", "model": "gemini-2.5-pro"}},
+        )
+        store = ConfigStore(config)
+        routed = store.snapshot_for_model("claude-opus-4-7")
+        route = routed.resolve_model_route("claude-opus-4-7")
+        self.assertEqual(routed.active_provider, "strong")
+        self.assertEqual(routed.model, "gemini-2.5-pro")
+        self.assertEqual(routed.upstream_protocol, "gemini")
+        self.assertEqual(routed.route_source, "model_routes")
+        self.assertEqual(route.upstream, "gemini-2.5-pro")
+        self.assertEqual(route.source, "model_routes")
+        self.assertEqual(store.state()["active_provider"], "main")
+
+    def test_primary_route_binding_tracks_active_route(self):
+        config = Config(
+            model="gpt-4.1",
+            active_provider="main",
+            active_model="gpt-4.1",
+            providers=[
+                {
+                    "id": "main",
+                    "name": "Main",
+                    "protocol": "openai",
+                    "upstream_base_url": "https://main.example/v1",
+                    "upstream_api_key": "sk-main",
+                    "models": ["gpt-4.1", "gpt-4.1-mini"],
+                    "upstream_chat_path": "/chat/completions",
+                    "upstream_messages_path": "/messages",
+                    "upstream_gemini_generate_path": "/models/{model}:generateContent",
+                    "upstream_gemini_stream_path": "/models/{model}:streamGenerateContent",
+                    "upstream_images_generations_path": "/images/generations",
+                    "upstream_images_edits_path": "/images/edits",
+                    "upstream_auth_header": "Authorization",
+                    "upstream_auth_scheme": "Bearer",
+                }
+            ],
+        )
+        store = ConfigStore(config)
+        state = store.bind_primary_route_model("claude-sonnet-4-6")
+        self.assertEqual(state["primary_route_model"], "claude-sonnet-4-6")
+        self.assertEqual(state["model_routes"]["claude-sonnet-4-6"], {"provider": "main", "model": "gpt-4.1"})
+        state = store.set_active("main", "gpt-4.1-mini")
+        self.assertEqual(state["model_routes"]["claude-sonnet-4-6"], {"provider": "main", "model": "gpt-4.1-mini"})
+        state = store.unbind_primary_route_model()
+        self.assertEqual(state["primary_route_model"], "")
+
+    def test_seen_models_are_recorded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Config(model="gpt-4.1", config_path=str(Path(tmpdir) / "config.json"))
+            store = ConfigStore(config)
+            store.record_seen_model("claude-sonnet-4-6")
+            store.record_seen_model("claude-sonnet-4-6")
+            seen = store.state()["seen_models"]["claude-sonnet-4-6"]
+        self.assertEqual(seen["count"], 2)
+        self.assertTrue(seen["last_seen"])
 
 
 if __name__ == "__main__":

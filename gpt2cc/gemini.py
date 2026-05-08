@@ -17,8 +17,9 @@ Writer = Callable[[bytes], None]
 
 def transform_anthropic_to_gemini(request: dict[str, Any], config: Config) -> tuple[dict[str, Any], TransformContext]:
     requested_model = str(request.get("model") or "")
-    upstream_model = config.resolve_model(requested_model)
-    ctx = TransformContext(requested_model=requested_model, upstream_model=upstream_model)
+    route = config.resolve_model_route(requested_model)
+    upstream_model = route.upstream
+    ctx = TransformContext(requested_model=requested_model, upstream_model=upstream_model, route_source=route.source)
     contents: list[dict[str, Any]] = []
 
     for message in request.get("messages", []):

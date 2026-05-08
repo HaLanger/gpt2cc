@@ -1,3 +1,4 @@
+import logging
 import http.client
 import json
 import tempfile
@@ -59,6 +60,15 @@ class AdminServerTests(unittest.TestCase):
         text = data.decode("utf-8")
         self.assertIn("gpt2cc relay console", text)
         self.assertIn("Gemini native", text)
+        self.assertIn("模型路由", text)
+        self.assertIn("当前路由概览", text)
+        self.assertIn("最近发现", text)
+        self.assertIn("绑定主模型", text)
+        self.assertIn("primaryBindDrawer", text)
+        self.assertNotIn("prompt(", text)
+        self.assertIn("routeSelection", text)
+        self.assertIn("syncRouteModels(preferredModel", text)
+        self.assertIn("setInterval", text)
         self.assertNotIn("sk-initial", text)
 
     def test_add_provider_and_switch_active_model(self):
@@ -103,6 +113,85 @@ class AdminServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("provider id", data.decode("utf-8"))
+
+    def test_model_route_api_saves_and_deletes_route(self):
+        status, _, _ = self.request(
+            "POST",
+            "/admin/providers",
+            {
+                "id": "strong",
+                "name": "Strong",
+                "protocol": "openai",
+                "upstream_base_url": "https://strong.example/v1",
+                "upstream_api_key": "sk-strong",
+                "models": ["deepseek-v4"],
+            },
+        )
+        self.assertEqual(status, 200)
+        status, _, data = self.request(
+            "POST",
+            "/admin/model-routes",
+            {"requested_model": "claude-opus-4-7", "provider_id": "strong", "model": "deepseek-v4"},
+        )
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertEqual(state["model_routes"]["claude-opus-4-7"], {"provider": "strong", "model": "deepseek-v4"})
+
+        status, _, data = self.request(
+            "POST",
+            "/admin/model-routes/delete",
+            {"requested_model": "claude-opus-4-7"},
+        )
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertNotIn("claude-opus-4-7", state["model_routes"])
+
+
+    def test_primary_route_binding_api_updates_state(self):
+        status, _, _ = self.request(
+            "POST",
+            "/admin/providers",
+            {
+                "id": "main",
+                "name": "Main",
+                "protocol": "openai",
+                "upstream_base_url": "https://main.example/v1",
+                "upstream_api_key": "sk-main",
+                "models": ["gpt-4.1", "gpt-4.1-mini"],
+            },
+        )
+        self.assertEqual(status, 200)
+        status, _, _ = self.request("POST", "/admin/active", {"provider_id": "main", "model": "gpt-4.1"})
+        self.assertEqual(status, 200)
+        status, _, data = self.request(
+            "POST",
+            "/admin/primary-route-model",
+            {"requested_model": "claude-sonnet-4-6"},
+        )
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertEqual(state["primary_route_model"], "claude-sonnet-4-6")
+        self.assertEqual(state["model_routes"]["claude-sonnet-4-6"], {"provider": "main", "model": "gpt-4.1"})
+        status, _, data = self.request("POST", "/admin/active", {"provider_id": "main", "model": "gpt-4.1-mini"})
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertEqual(state["model_routes"]["claude-sonnet-4-6"], {"provider": "main", "model": "gpt-4.1-mini"})
+        status, _, data = self.request("POST", "/admin/primary-route-model", {"requested_model": ""})
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertEqual(state["primary_route_model"], "")
+
+    def test_admin_state_polling_is_not_logged(self):
+        logger = logging.getLogger("gpt2cc.server")
+        with self.assertLogs(logger, level="INFO") as captured:
+            status, _, _ = self.request("GET", "/admin")
+        self.assertEqual(status, 200)
+        self.assertTrue(any("GET /admin HTTP" in message for message in captured.output))
+
+        with self.assertNoLogs(logger, level="INFO"):
+            status, _, _ = self.request("GET", "/admin/state")
+        self.assertEqual(status, 200)
+
     def test_admin_url_uses_localhost_for_loopback(self):
         self.assertEqual(admin_url(Config(host="127.0.0.1", port=3456)), "http://localhost:3456/admin")
         self.assertEqual(admin_url(Config(host="0.0.0.0", port=3456)), "http://localhost:3456/admin")

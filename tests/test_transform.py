@@ -114,6 +114,13 @@ class TransformTests(unittest.TestCase):
             payload["messages"][0]["reasoning_content"],
             json.dumps({"type": "thinking", "thinking": "reasoning", "signature": "sig_1"}, ensure_ascii=False),
         )
+    def test_model_route_source_is_exposed_in_context(self):
+        payload, ctx = transform_anthropic_to_openai(
+            {"model": "claude-opus-4-7", "messages": []},
+            Config(model="deepseek-v4", route_source="model_routes"),
+        )
+        self.assertEqual(payload["model"], "deepseek-v4")
+        self.assertEqual(ctx.upstream_model, "deepseek-v4")
 
 
 if __name__ == "__main__":

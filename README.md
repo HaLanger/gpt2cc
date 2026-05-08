@@ -8,7 +8,7 @@
 - 支持非流式响应和 Anthropic SSE 流式响应
 - 支持 Claude Code 工具调用：Anthropic `tool_use`/`tool_result` ↔ OpenAI `tool_calls`/`tool`
 - 支持 `system`、`messages`、`max_tokens`、`temperature`、`top_p`、`stop_sequences`
-- 支持模型映射：把 Claude Code 请求的 Claude 模型名映射到你的 Codex 中转站模型名
+- 支持多模型路由：记录 Claude Code 实际请求的模型名，并把不同请求路由到不同中转站/模型
 - 支持本地代理鉴权，避免同网段误用
 - 支持 `/v1/messages/count_tokens` 近似估算，满足 Claude Code 预算检查
 - 支持 `/v1/models`、`/healthz`、`/debug/config`
@@ -144,7 +144,17 @@ Provider 配置示例见 `config.example.json`。每个中转站至少需要：
 }
 ``` 
 
-旧版配置文件里的 provider 如果没有 `protocol` 字段，会自动按 `openai` 处理。
+管理界面还提供“模型路由”区域。gpt2cc 会记录 Claude Code 最近实际请求过的模型名，你可以把每个 Claude Code 模型路由到任意中转站和该中转站下的任意模型；未配置路由的请求继续使用当前激活中转站和当前激活模型。
+
+例如可以配置：
+
+```text
+claude-opus-4-7             -> strong-relay / deepseek-v4
+claude-sonnet-4-6           -> main-relay / qwen-coder-plus
+claude-haiku-4-5-20251001   -> cheap-relay / qwen-coder-lite
+```
+
+模型路由只影响当前请求，不会改变管理台里的当前激活中转站，因此 Claude Code 多模型并发请求不会互相污染全局状态。
 
 ## 高级：使用 `.env` / 环境变量预置配置
 
@@ -168,6 +178,37 @@ $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:3456"
 $env:ANTHROPIC_AUTH_TOKEN = "local-claude-code-key"
 claude
 ```
+
+## 多模型路由
+
+Claude Code 会随着版本更新调整它请求的模型名。你不需要提前猜这些名字：先启动 gpt2cc 并正常使用 Claude Code，管理台会自动记录最近发现的请求模型。打开顶部“模型路由”即可把每个 Claude Code 模型指定到任意中转站和该中转站下的任意模型。
+
+主页面的“当前路由概览”会显示：
+
+- 当前主路由：未配置模型路由的请求会使用这个中转站/模型
+- 已配置模型路由：每个 Claude Code 请求模型当前指向哪里
+- 主模型绑定：可以把 Claude Code 的默认模型绑定到当前主路由
+
+主模型绑定适合这种场景：Claude Code 默认模型是 `claude-sonnet-4-6`，你希望它始终跟随 gpt2cc 当前主路由。绑定后，在 gpt2cc 里切换当前中转站或模型时，`claude-sonnet-4-6` 对应的模型路由会同步更新。解绑后，已有路由会保留，但不再跟随主路由切换。
+
+配置文件中对应字段是：
+
+```json
+"model_routes": {
+  "claude-opus-4-7": {"provider": "strong-relay", "model": "deepseek-v4"},
+  "claude-sonnet-4-6": {"provider": "main-relay", "model": "qwen-coder-plus"},
+  "claude-haiku-4-5-20251001": {"provider": "cheap-relay", "model": "qwen-coder-lite"}
+},
+"primary_route_model": "claude-sonnet-4-6"
+```
+
+运行时日志会显示实际路线：
+
+```text
+requested=claude-opus-4-7 upstream=deepseek-v4 route=model_routes provider=Strong Relay
+```
+
+管理台会定期刷新最近发现模型，但 `/admin/state` 轮询日志会被静音，避免刷屏。旧版 `GPT2CC_MODEL_MAP` / `model_map` 仍然兼容，但新配置建议使用 `model_routes`，因为它能指定 provider + model，而不只是模型名替换。
 
 ## 证书错误排查
 
@@ -202,7 +243,7 @@ GPT2CC_UPSTREAM_SSL_VERIFY=false
 
 另一个容易混淆的点：如果设置了 `GPT2CC_PROXY_API_KEY=local-claude-code-key`，那么 Claude Code 的 `ANTHROPIC_AUTH_TOKEN` 或 ccswitch 里填写的 API key 也必须是 `local-claude-code-key`。本地代理 key 不需要等于中转站 API key。
 
-## 模型映射
+## 兼容：旧版模型映射
 
 如果你希望不同 Claude 模型映射到不同上游模型：
 

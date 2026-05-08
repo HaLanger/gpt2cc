@@ -52,6 +52,8 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
         protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt: str, *args: Any) -> None:
+            if self.command == "GET" and self.path.split("?", 1)[0] == "/admin/state":
+                return
             LOG.info("%s - %s", self.address_string(), fmt % args)
 
         def do_OPTIONS(self) -> None:
@@ -131,6 +133,31 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                     payload = self._read_json()
                     self._send_json(store.set_active(str(payload.get("provider_id") or ""), str(payload.get("model") or "")))
                     return
+                if path == "/admin/model-routes":
+                    self._require_auth()
+                    payload = self._read_json()
+                    self._send_json(
+                        store.set_model_route(
+                            str(payload.get("requested_model") or ""),
+                            str(payload.get("provider_id") or payload.get("provider") or ""),
+                            str(payload.get("model") or ""),
+                        )
+                    )
+                    return
+                if path == "/admin/model-routes/delete":
+                    self._require_auth()
+                    payload = self._read_json()
+                    self._send_json(store.delete_model_route(str(payload.get("requested_model") or "")))
+                    return
+                if path == "/admin/primary-route-model":
+                    self._require_auth()
+                    payload = self._read_json()
+                    requested_model = str(payload.get("requested_model") or "")
+                    if requested_model:
+                        self._send_json(store.bind_primary_route_model(requested_model))
+                    else:
+                        self._send_json(store.unbind_primary_route_model())
+                    return
                 if path == "/v1/messages":
                     self._handle_messages()
                     return
@@ -153,8 +180,11 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
 
         def _handle_messages(self) -> None:
             self._require_auth()
-            request_config = store.snapshot()
-            request = self._read_json(request_config)
+            initial_config = store.snapshot()
+            request = self._read_json(initial_config)
+            requested_model = str(request.get("model") or "")
+            store.record_seen_model(requested_model)
+            request_config = store.snapshot_for_model(requested_model)
             if request_config.debug_payloads:
                 LOG.debug("anthropic request: %s", json.dumps(request, ensure_ascii=False))
 
@@ -169,10 +199,11 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
         def _handle_anthropic_messages(self, request: dict[str, Any], request_config: Config) -> None:
             upstream_payload = build_anthropic_payload(request, request_config)
             LOG.info(
-                "model route: requested=%s upstream=%s endpoint=anthropic/messages stream=%s protocol=anthropic provider=%s",
+                "model route: requested=%s upstream=%s endpoint=anthropic/messages stream=%s protocol=anthropic route=%s provider=%s",
                 request.get("model") or "<empty>",
                 upstream_payload.get("model"),
                 upstream_payload.get("stream"),
+                request_config.resolve_model_route(str(request.get("model") or "")).source,
                 request_config.active_provider_label(),
             )
             if upstream_payload.get("stream"):
@@ -188,10 +219,11 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
             upstream_payload, ctx = transform_anthropic_to_gemini(request, request_config)
             stream = bool(request.get("stream") or request_config.force_stream)
             LOG.info(
-                "model route: requested=%s upstream=%s endpoint=gemini/generateContent stream=%s protocol=gemini provider=%s",
+                "model route: requested=%s upstream=%s endpoint=gemini/generateContent stream=%s protocol=gemini route=%s provider=%s",
                 ctx.requested_model or "<empty>",
                 ctx.upstream_model,
                 stream,
+                ctx.route_source,
                 request_config.active_provider_label(),
             )
             if request_config.debug_payloads:
@@ -211,13 +243,14 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 has_references = request_has_reference_images(request, request_config)
                 endpoint = "images/edits" if has_references else "images/generations"
                 LOG.info(
-                    "model route: requested=%s upstream=%s endpoint=%s stream=%s tools_ignored=%s references=%s provider=%s",
+                    "model route: requested=%s upstream=%s endpoint=%s stream=%s tools_ignored=%s references=%s route=%s provider=%s",
                     ctx.requested_model or "<empty>",
                     ctx.upstream_model,
                     endpoint,
                     upstream_payload.get("stream"),
                     len(upstream_payload.get("tools") or []),
                     has_references,
+                    ctx.route_source,
                     request_config.active_provider_label(),
                 )
 
@@ -267,11 +300,12 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 return
 
             LOG.info(
-                "model route: requested=%s upstream=%s endpoint=chat/completions stream=%s tools=%s provider=%s",
+                "model route: requested=%s upstream=%s endpoint=chat/completions stream=%s tools=%s route=%s provider=%s",
                 ctx.requested_model or "<empty>",
                 ctx.upstream_model,
                 upstream_payload.get("stream"),
                 len(upstream_payload.get("tools") or []),
+                ctx.route_source,
                 request_config.active_provider_label(),
             )
             if request_config.debug_payloads:
@@ -403,6 +437,7 @@ input,textarea,select {{ width:100%; border:1px solid var(--line); border-radius
 button {{ border:0; border-radius:12px; padding:10px 13px; font-weight:750; cursor:pointer; background:#e8eefc; color:#1e3a8a; white-space:nowrap; }} button.primary {{ background:var(--brand); color:white; }} button.danger {{ background:#fee2e2; color:#991b1b; }} button.ghost {{ background:#f8fafc; color:#334155; border:1px solid var(--line); }} button:hover {{ filter:brightness(.97); }}
 .banner {{ display:none; margin-bottom:14px; padding:11px 13px; border-radius:14px; font-weight:700; }} .banner.ok {{ display:block; background:#dcfce7; color:#166534; }} .banner.err {{ display:block; background:#fee2e2; color:#991b1b; }} .auth {{ display:none; margin-bottom:14px; }} .auth.show {{ display:block; }}
 .list {{ display:grid; gap:8px; }} .row {{ display:grid; grid-template-columns:1.35fr 1.2fr .9fr auto; gap:12px; align-items:center; padding:12px; border:1px solid var(--line); background:white; border-radius:16px; }} .row.active {{ border-color:#93c5fd; box-shadow:0 10px 30px rgba(37,99,235,.10); }}
+.route-row {{ display:grid; grid-template-columns:1.3fr .8fr .8fr auto; gap:10px; align-items:center; padding:10px; border:1px solid var(--line); border-radius:14px; background:white; margin-top:8px; }} .route-form {{ display:grid; grid-template-columns:1.2fr .8fr .8fr auto; gap:10px; align-items:end; margin-top:14px; }} .route-summary {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }} .summary-card {{ background:white; border:1px solid var(--line); border-radius:16px; padding:13px; }} .summary-card strong {{ display:block; margin-bottom:5px; }} .route-drawer {{ width:min(860px,calc(100vw - 36px)); }} .hidden {{ display:none; }} .muted {{ color:var(--muted); }}
 .name {{ font-weight:800; }} .sub {{ color:var(--muted); font-size:12px; margin-top:3px; word-break:break-all; }} .models {{ display:flex; flex-wrap:wrap; gap:5px; max-height:160px; overflow:auto; }} .model {{ border:1px solid var(--line); background:#f8fafc; border-radius:999px; padding:4px 8px; font-size:12px; }} button.model {{ color:#334155; font-weight:750; }} button.model.active-model {{ background:#dbeafe; border-color:#93c5fd; color:#1d4ed8; }} .pill {{ border-radius:999px; padding:4px 9px; background:#eef2ff; color:#1d4ed8; font-size:12px; font-weight:800; display:inline-block; margin-left:6px; }} .protocol {{ border-radius:999px; padding:3px 8px; background:#ecfdf5; color:#047857; font-size:11px; font-weight:800; display:inline-block; margin-left:6px; }} .actions {{ display:flex; gap:7px; justify-content:flex-end; flex-wrap:wrap; }} .empty {{ text-align:center; color:var(--muted); padding:32px; }}
 .drawer-backdrop {{ position:fixed; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:.18s; }} .drawer-backdrop.show {{ opacity:1; pointer-events:auto; }} .drawer {{ position:fixed; top:18px; right:18px; bottom:18px; width:min(460px,calc(100vw - 36px)); padding:20px; overflow:auto; transform:translateX(calc(100% + 28px)); transition:.2s; }} .drawer.show {{ transform:translateX(0); }} .drawer-head {{ display:flex; justify-content:space-between; align-items:center; gap:12px; }} .drawer h2 {{ margin:0; }} label {{ display:block; color:#334155; font-size:13px; font-weight:750; margin:13px 0 6px; }}
 @media (max-width:900px) {{ .hero,.toolbar,.row {{ grid-template-columns:1fr; }} .actions {{ justify-content:flex-start; }} }}
@@ -410,13 +445,17 @@ button {{ border:0; border-radius:12px; padding:10px 13px; font-weight:750; curs
 </head>
 <body>
 <div class=\"shell\">
-  <div class=\"hero\"><div><h1>gpt2cc relay console</h1><div class=\"subtitle\">管理中转站、API key 和模型，新请求会立即使用当前选择。</div></div><div class=\"status\"><small>当前激活</small><strong id=\"activeTitle\">Loading...</strong><small id=\"configPath\"></small></div></div>
+  <div class=\"hero\"><div><h1>gpt2cc relay console</h1><div class=\"subtitle\">管理中转站、API key 和模型，新请求会立即使用当前选择。</div></div><div class=\"status\"><small>当前主路由</small><strong id=\"activeTitle\">Loading...</strong><small id=\"configPath\"></small></div></div>
+  <div class=\"actions\" style=\"justify-content:flex-start;margin-bottom:16px\"><button class=\"primary\" onclick=\"openRoutes()\">模型路由</button><button class=\"ghost\" onclick=\"load()\">刷新状态</button></div>
   <div id=\"banner\" class=\"banner\"></div>
   <div id=\"authBox\" class=\"panel auth\"><b>代理密钥</b><div class=\"muted\">此服务启用了 GPT2CC_PROXY_API_KEY。密钥只保存在本次浏览器会话。</div><div class=\"toolbar\"><input id=\"proxyKey\" type=\"password\" autocomplete=\"off\" placeholder=\"Proxy API key\"><button class=\"primary\" onclick=\"saveProxyKey()\">保存并连接</button></div></div>
+  <section class=\"panel\" style=\"margin-bottom:16px\"><h2 style=\"margin:0 0 10px\">当前路由概览</h2><div id=\"routeOverview\" class=\"route-summary\"></div></section>
   <section class=\"panel\"><div class=\"toolbar\"><input id=\"searchBox\" placeholder=\"搜索中转站名称、ID、域名或模型...\" oninput=\"render()\"><button class=\"ghost\" onclick=\"clearSearch()\">清除搜索</button><button class=\"primary\" onclick=\"openForm()\">添加中转站</button></div><div id=\"providers\" class=\"list\"></div></section>
 </div>
 <div id=\"drawerBackdrop\" class=\"drawer-backdrop\" onclick=\"closeForm()\"></div>
 <aside id=\"drawer\" class=\"drawer\"><div class=\"drawer-head\"><h2 id=\"formTitle\">添加中转站</h2><button class=\"ghost\" onclick=\"closeForm()\">关闭</button></div><label>ID</label><input id=\"providerId\" placeholder=\"my-relay\"><label>名称</label><input id=\"providerName\" placeholder=\"My Relay\"><label>协议</label><select id=\"protocol\"><option value=\"openai\">OpenAI-compatible</option><option value=\"anthropic\">Anthropic Messages</option><option value=\"gemini\">Gemini native</option></select><label>Base URL</label><input id=\"baseUrl\" placeholder=\"https://relay.example.com/v1\"><label>API key</label><input id=\"apiKey\" type=\"password\" placeholder=\"编辑时留空表示保留原 key\"><label>模型（每行一个）</label><textarea id=\"models\" placeholder=\"gpt-4.1&#10;gpt-image-2\"></textarea><div class=\"actions\"><button class=\"primary\" onclick=\"saveProvider()\">保存中转站</button><button onclick=\"resetForm()\">清空</button></div><p class=\"muted\">关闭面板不会清空未保存内容；再次点“添加中转站”会继续显示。</p></aside>
+<aside id=\"routeDrawer\" class=\"drawer route-drawer\"><div class=\"drawer-head\"><h2>模型路由配置</h2><button class=\"ghost\" onclick=\"closeRoutes()\">关闭</button></div><div class=\"muted\">已配置路由会优先命中；未配置模型使用当前主路由。最近发现会自动刷新。</div><div class=\"route-form\"><label>Claude Code 模型<input id=\"routeRequested\" placeholder=\"claude-opus-4-7\"></label><label>中转站<select id=\"routeProvider\" onchange=\"syncRouteModels()\"></select></label><label>上游模型<select id=\"routeModel\"></select></label><button class=\"primary\" onclick=\"saveRoute()\">保存路由</button></div><h3>已配置路由</h3><div id=\"configuredRoutes\"></div><h3><button class=\"ghost\" onclick=\"toggleSeenRoutes()\">最近发现</button></h3><div id=\"seenRoutes\" class=\"hidden\"></div></aside>
+<aside id=\"primaryBindDrawer\" class=\"drawer\"><div class=\"drawer-head\"><h2>绑定主模型</h2><button class=\"ghost\" onclick=\"closePrimaryBind()\">关闭</button></div><div class=\"muted\">选择 Claude Code 默认请求的模型。绑定后，切换当前主路由会同步更新这个模型的路由。</div><div id=\"primaryBindList\" style=\"margin-top:14px\"></div></aside>
 <script>
 const AUTH_REQUIRED = {auth_hint};
 let state = null;
@@ -426,22 +465,41 @@ function show(msg, cls='ok') {{ const b=document.getElementById('banner'); b.cla
 function esc(s) {{ return String(s ?? '').replace(/[&<>\"]/g, c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c])); }}
 function saveProxyKey() {{ sessionStorage.setItem('gpt2cc_proxy_key', document.getElementById('proxyKey').value); load(); }}
 async function api(path, opts={{}}) {{ const r=await fetch(path, {{...opts, headers:{{...headers(), ...(opts.headers||{{}})}}}}); if(r.status===401) {{ document.getElementById('authBox').classList.add('show'); throw new Error('需要代理密钥'); }} const data=await r.json(); if(!r.ok) throw new Error(data.error?.message || '请求失败'); return data; }}
-async function load() {{ try {{ state=await api('/admin/state'); document.getElementById('authBox').classList.toggle('show', AUTH_REQUIRED && !key()); render(); }} catch(e) {{ show(e.message,'err'); }} }}
+async function load(silent=false) {{ try {{ const selections={{}}; document.querySelectorAll('select[id^="sel-"]').forEach(s=>selections[s.id]=s.value); const routeSelection={{provider:routeProvider?.value||'', model:routeModel?.value||''}}; state=await api('/admin/state'); document.getElementById('authBox').classList.toggle('show', AUTH_REQUIRED && !key()); render(); Object.entries(selections).forEach(([id,value])=>{{ const sel=document.getElementById(id); if(sel&&[...sel.options].some(o=>o.value===value)) sel.value=value; }}); if(routeSelection.provider && (state.providers||[]).some(p=>p.id===routeSelection.provider)) {{ routeProvider.value=routeSelection.provider; syncRouteModels(routeSelection.model); }} }} catch(e) {{ if(!silent) show(e.message,'err'); }} }}
 function providerText(p) {{ return [p.id,p.name,p.protocol,p.upstream_base_url,...(p.models||[])].join(' ').toLowerCase(); }}
 function filteredProviders() {{ const q=(searchBox.value||'').trim().toLowerCase(); return !q ? state.providers : state.providers.filter(p=>providerText(p).includes(q)); }}
 function clearSearch() {{ searchBox.value=''; render(); }}
-function render() {{ const active=state.providers.find(p=>p.id===state.active_provider); activeTitle.textContent=(active?.name||state.active_provider)+' / '+state.active_model; configPath.textContent='配置文件：'+state.config_path; const items=filteredProviders(); providers.innerHTML=items.length ? items.map(p=>rowHtml(p)).join('') : '<div class="empty">没有匹配的中转站</div>'; }}
+function render() {{ const active=state.providers.find(p=>p.id===state.active_provider); activeTitle.textContent=(active?.name||state.active_provider)+' / '+state.active_model; configPath.textContent='配置文件：'+state.config_path; const items=filteredProviders(); providers.innerHTML=items.length ? items.map(p=>rowHtml(p)).join('') : '<div class="empty">没有匹配的中转站</div>'; renderRouteOverview(); renderRoutes(); }}
 function protocolName(protocol) {{ return ({{openai:'OpenAI',anthropic:'Anthropic',gemini:'Gemini'}})[protocol||'openai'] || protocol || 'OpenAI'; }}
 function rowHtml(p) {{ const active=p.id===state.active_provider; const protocol=p.protocol||'openai'; const models=p.models||[]; const visible=models.map(m=>`<button class="model ${{active&&m===state.active_model?'active-model':''}}" onclick="activateModel('${{esc(p.id)}}',decodeURIComponent('${{encodeURIComponent(m)}}'))">${{esc(m)}}</button>`).join('') || '<span class="muted">未配置模型</span>'; return `<div class="row ${{active?'active':''}}"><div><div class="name">${{esc(p.name)}}<span class="protocol">${{esc(protocolName(protocol))}}</span>${{active?'<span class="pill">Active</span>':''}}</div><div class="sub">${{esc(p.id)}} · ${{p.has_api_key?'key 已保存':'未设置 key'}}</div></div><div class="sub">${{esc(p.upstream_base_url)}}</div><div class="models">${{visible}}</div><div class="actions"><select id="sel-${{esc(p.id)}}">${{models.map(m=>`<option ${{m===state.active_model?'selected':''}}>${{esc(m)}}</option>`).join('')}}</select><button class="primary" onclick="activate('${{esc(p.id)}}')">切换</button><button onclick="editProvider('${{esc(p.id)}}')">编辑</button><button class="danger" onclick="deleteProvider('${{esc(p.id)}}')">删除</button></div></div>`; }}
+function routeText(model) {{ const r=(state.model_routes||{{}})[model]; if(!r) return '未配置'; return `${{r.provider}} / ${{r.model}}`; }}
+function routeRow(model, info) {{ return `<div class="route-row"><div><b>${{esc(model)}}</b><div class="sub">次数 ${{info?.count||0}} · ${{esc(info?.last_seen||'')}}</div></div><div>${{esc(routeText(model))}}</div><div></div><div class="actions"><button onclick="fillRoute('${{encodeURIComponent(model)}}')">设置路由</button></div></div>`; }}
+function configuredRouteRow(model, route) {{ return `<div class="route-row"><div><b>${{esc(model)}}</b></div><div>${{esc(route.provider)}}</div><div>${{esc(route.model)}}</div><div class="actions"><button onclick="fillRoute('${{encodeURIComponent(model)}}')">编辑</button><button class="danger" onclick="deleteRoute('${{encodeURIComponent(model)}}')">删除</button></div></div>`; }}
+function renderRoutes() {{ const seen=state.seen_models||{{}}; const routes=state.model_routes||{{}}; const selectedProvider=routeProvider.value; const selectedModel=routeModel.value; const seenKeys=Object.keys(seen).sort((a,b)=>String(seen[b].last_seen||'').localeCompare(String(seen[a].last_seen||''))); seenRoutes.innerHTML=seenKeys.length ? seenKeys.map(m=>routeRow(m, seen[m])).join('') : '<div class="empty">还没有发现 Claude Code 请求模型；发起一次请求后会自动显示在这里。</div>'; const routeKeys=Object.keys(routes).sort(); configuredRoutes.innerHTML=routeKeys.length ? routeKeys.map(m=>configuredRouteRow(m, routes[m])).join('') : '<div class="empty">还没有配置模型路由。</div>'; routeProvider.innerHTML=(state.providers||[]).map(p=>`<option value="${{esc(p.id)}}">${{esc(p.name||p.id)}}</option>`).join(''); if(selectedProvider && (state.providers||[]).some(p=>p.id===selectedProvider)) routeProvider.value=selectedProvider; syncRouteModels(selectedModel); }}
+function syncRouteModels(preferredModel='') {{ const previous=preferredModel||routeModel.value; const p=(state.providers||[]).find(x=>x.id===routeProvider.value) || (state.providers||[])[0]; routeModel.innerHTML=((p&&p.models)||[]).map(m=>`<option>${{esc(m)}}</option>`).join(''); if(previous && ((p&&p.models)||[]).includes(previous)) routeModel.value=previous; }}
+function fillRoute(encoded) {{ const model=decodeURIComponent(encoded); const r=(state.model_routes||{{}})[model]||{{}}; routeRequested.value=model; routeProvider.value=r.provider||state.active_provider; syncRouteModels(); routeModel.value=r.model||state.active_model; routeRequested.scrollIntoView({{behavior:'smooth',block:'center'}}); }}
+async function saveRoute() {{ try {{ await api('/admin/model-routes', {{method:'POST', body:JSON.stringify({{requested_model:routeRequested.value,provider_id:routeProvider.value,model:routeModel.value}})}}); await load(); show('模型路由已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
+async function deleteRoute(encoded) {{ if(!confirm('删除这个模型路由？')) return; try {{ await api('/admin/model-routes/delete', {{method:'POST', body:JSON.stringify({{requested_model:decodeURIComponent(encoded)}})}}); await load(); show('模型路由已删除'); }} catch(e) {{ show(e.message,'err'); }} }}
+function providerName(id) {{ const p=(state.providers||[]).find(x=>x.id===id); return p ? (p.name||p.id) : id; }}
+function renderRouteOverview() {{ const routes=state.model_routes||{{}}; const routeKeys=Object.keys(routes).sort(); const bound=state.primary_route_model||''; const bindText=bound ? `已绑定：${{esc(bound)}}` : '未绑定 Claude Code 默认模型'; const bindAction=bound ? '<button class="danger" onclick="unbindPrimaryRoute()">解绑主模型</button>' : '<button onclick="openPrimaryBind()">绑定主模型</button>'; const defaultCard=`<div class="summary-card"><strong>当前主路由</strong><div>${{esc(providerName(state.active_provider))}} / ${{esc(state.active_model)}}</div><div class="sub">${{bindText}}</div><div class="actions" style="justify-content:flex-start;margin-top:8px">${{bindAction}}</div></div>`; const routeCards=routeKeys.length ? routeKeys.map(m=>`<div class="summary-card"><strong>${{esc(m)}}</strong><div>${{esc(providerName(routes[m].provider))}} / ${{esc(routes[m].model)}}</div></div>`).join('') : '<div class="summary-card"><strong>具体模型路由</strong><div class="muted">尚未配置，点击上方“模型路由”添加。</div></div>'; routeOverview.innerHTML=defaultCard+routeCards; }}
+function openRoutes() {{ routeDrawer.classList.add('show'); drawerBackdrop.classList.add('show'); renderRoutes(); }}
+function primaryBindRow(model, info) {{ const active=model===state.primary_route_model; return `<div class="route-row"><div><b>${{esc(model)}}</b><div class="sub">次数 ${{info?.count||0}} · ${{esc(info?.last_seen||'')}}</div></div><div>${{esc(routeText(model))}}</div><div>${{active?'<span class="pill">已绑定</span>':''}}</div><div class="actions"><button class="primary" onclick="savePrimaryBind('${{encodeURIComponent(model)}}')">绑定</button></div></div>`; }}
+function openPrimaryBind() {{ const seen=state.seen_models||{{}}; const keys=Object.keys(seen).sort((a,b)=>String(seen[b].last_seen||'').localeCompare(String(seen[a].last_seen||''))); primaryBindList.innerHTML=keys.length ? keys.map(m=>primaryBindRow(m, seen[m])).join('') : '<div class="empty">还没有发现 Claude Code 请求模型；先发起一次 Claude Code 请求后再绑定。</div>'; primaryBindDrawer.classList.add('show'); drawerBackdrop.classList.add('show'); }}
+function closePrimaryBind() {{ primaryBindDrawer.classList.remove('show'); if(!drawer.classList.contains('show')&&!routeDrawer.classList.contains('show')) drawerBackdrop.classList.remove('show'); }}
+async function savePrimaryBind(encoded) {{ try {{ await api('/admin/primary-route-model', {{method:'POST', body:JSON.stringify({{requested_model:decodeURIComponent(encoded)}})}}); closePrimaryBind(); await load(); show('主模型已绑定，后续切换主路由会同步更新它的模型路由'); }} catch(e) {{ show(e.message,'err'); }} }}
+async function unbindPrimaryRoute() {{ if(!confirm('解绑主模型？现有模型路由会保留，不再随主路由切换。')) return; try {{ await api('/admin/primary-route-model', {{method:'POST', body:JSON.stringify({{requested_model:''}})}}); await load(); show('主模型已解绑'); }} catch(e) {{ show(e.message,'err'); }} }}
+function closeRoutes() {{ routeDrawer.classList.remove('show'); if(!drawer.classList.contains('show')&&!primaryBindDrawer.classList.contains('show')) drawerBackdrop.classList.remove('show'); }}
+function toggleSeenRoutes() {{ seenRoutes.classList.toggle('hidden'); }}
+
 function openForm() {{ drawer.classList.add('show'); drawerBackdrop.classList.add('show'); }}
-function closeForm() {{ drawer.classList.remove('show'); drawerBackdrop.classList.remove('show'); }}
+function closeForm() {{ drawer.classList.remove('show'); if(!routeDrawer.classList.contains('show')&&!primaryBindDrawer.classList.contains('show')) drawerBackdrop.classList.remove('show'); }}
 function editProvider(id) {{ const p=state.providers.find(x=>x.id===id); if(!p) return; formTitle.textContent='编辑中转站'; providerId.value=p.id; providerName.value=p.name; protocol.value=p.protocol||'openai'; baseUrl.value=p.upstream_base_url; apiKey.value=''; models.value=(p.models||[]).join('\\n'); openForm(); }}
 function resetForm() {{ formTitle.textContent='添加中转站'; providerId.value=''; providerName.value=''; protocol.value='openai'; baseUrl.value=''; apiKey.value=''; models.value=''; }}
 async function saveProvider() {{ try {{ await api('/admin/providers', {{method:'POST', body:JSON.stringify({{id:providerId.value,name:providerName.value,protocol:protocol.value,upstream_base_url:baseUrl.value,upstream_api_key:apiKey.value,models:models.value.split(/\\n+/).map(x=>x.trim()).filter(Boolean)}})}}); resetForm(); closeForm(); await load(); show('中转站已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function activate(id) {{ try {{ const sel=document.getElementById('sel-'+id); await activateModel(id, sel?.value||''); }} catch(e) {{ show(e.message,'err'); }} }}
 async function activateModel(id, model) {{ try {{ await api('/admin/active', {{method:'POST', body:JSON.stringify({{provider_id:id, model}})}}); await load(); show('已切换，新的请求会立即使用该配置'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function deleteProvider(id) {{ if(!confirm('删除这个中转站？')) return; try {{ await api('/admin/providers/delete', {{method:'POST', body:JSON.stringify({{id}})}}); await load(); show('中转站已删除'); }} catch(e) {{ show(e.message,'err'); }} }}
-load();
+load(); setInterval(()=>load(true), 2500);
 </script>
 </body>
 </html>"""
