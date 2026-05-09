@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import http.client
 import json
 import tempfile
@@ -149,6 +151,21 @@ class AdminUsageStatsTests(unittest.TestCase):
         self.assertGreater(breakdown[("relay-b", "gpt-4.1")]["total_cost"], 0)
         self.assertFalse(breakdown[("relay-a", "gpt-4.1-mini")]["has_pricing"])
 
+        status, data = self.request(
+            "GET",
+            "/admin/usage/summary?start=2026-05-09T10:30:00Z&end=2026-05-09T11:30:00Z",
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(data.decode("utf-8"))
+        self.assertEqual(payload["records"], 1)
+        self.assertEqual(payload["totals"]["records"], 1)
+        self.assertEqual(payload["totals"]["input_tokens"], 40)
+        self.assertEqual(payload["totals"]["output_tokens"], 20)
+        self.assertEqual(payload["totals"]["cache_read_input_tokens"], 10)
+        self.assertEqual(len(payload["provider_model_breakdown"]), 1)
+        self.assertEqual(payload["provider_model_breakdown"][0]["provider_id"], "relay-b")
+        self.assertEqual(payload["provider_model_breakdown"][0]["upstream_model"], "gpt-4.1")
+
     def test_usage_history_returns_recent_records_with_limit(self):
         status, data = self.request("GET", "/admin/usage/history?limit=2")
         self.assertEqual(status, 200)
@@ -157,6 +174,21 @@ class AdminUsageStatsTests(unittest.TestCase):
         self.assertEqual(payload["total"], 3)
         self.assertEqual(payload["records"][0]["ts"], "2026-05-09T12:00:00Z")
         self.assertEqual(payload["records"][1]["ts"], "2026-05-09T11:00:00Z")
+
+        status, data = self.request(
+            "GET",
+            "/admin/usage/history?limit=20&start=2026-05-09T10:30:00Z&end=2026-05-09T11:30:00Z",
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(data.decode("utf-8"))
+        self.assertEqual(payload["returned"], 1)
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["records"][0]["ts"], "2026-05-09T11:00:00Z")
+
+    def test_usage_invalid_date_returns_400(self):
+        status, data = self.request("GET", "/admin/usage/summary?start=not-a-date")
+        self.assertEqual(status, 400)
+        self.assertIn("invalid start datetime", data.decode("utf-8"))
 
     def test_usage_page_requires_auth(self):
         status, _ = self.request("GET", "/admin/usage", key=None)
@@ -171,15 +203,39 @@ class AdminUsageStatsTests(unittest.TestCase):
         self.assertIn("总会话数", text)
         self.assertIn("预估费用", text)
         self.assertIn("缓存命中率", text)
-        self.assertIn("读取 /", text)
+        self.assertIn("datetime-local", text)
+        self.assertIn("最近一周", text)
+        self.assertIn("最近一天", text)
+        self.assertIn("最近 1 小时", text)
+        self.assertIn("rangeQueryParams", text)
+        self.assertIn("toLocaleString", text)
         self.assertIn("/admin/usage/summary", text)
-        self.assertIn("/admin/usage/history?limit=20", text)
+        self.assertIn("/admin/usage/history", text)
+        self.assertIn("limit', String(limit)", text)
         self.assertIn("模型分布", text)
         self.assertIn("最近 20 条请求", text)
-        self.assertIn("Provider / Model", text)
+        self.assertIn("Provider / 模型", text)
         self.assertIn("缓存命中情况", text)
         self.assertIn("Provider / Model 成本明细", text)
         self.assertIn("返回管理台", text)
+        self.assertIn("function el(id)", text)
+        self.assertIn("function formatLocalDateTime(value)", text)
+        self.assertIn("padStart(2,'0')", text)
+        self.assertIn("el('banner')", text)
+        self.assertIn("el('proxyKey').value", text)
+        self.assertIn("el('startAt').value", text)
+        self.assertIn("el('endAt').value", text)
+        self.assertIn("el('authBox').classList", text)
+        self.assertIn("el('cards').innerHTML", text)
+        self.assertIn("el('modelDistribution').innerHTML", text)
+        self.assertIn("el('requestRows').innerHTML", text)
+        self.assertIn("el('costRows').innerHTML", text)
+        self.assertIn("el('statsPath').textContent", text)
+        self.assertIn("new Date(el('startAt').value).toISOString()", text)
+        self.assertIn("new Date(el('endAt').value).toISOString()", text)
+        self.assertIn("el('startAt').value=formatLocalDateTime(start)", text)
+        self.assertIn("el('endAt').value=formatLocalDateTime(end)", text)
+        self.assertNotIn("toISOString().slice(0,16)", text)
 
     def test_admin_home_links_to_usage_page_without_embedding_dashboard(self):
         status, data = self.request("GET", "/admin")

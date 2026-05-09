@@ -1,6 +1,9 @@
 import logging
 import http.client
 import json
+import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -50,6 +53,14 @@ class AdminServerTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def extract_admin_script(self):
+        status, _, data = self.request("GET", "/admin")
+        self.assertEqual(status, 200)
+        html = data.decode("utf-8")
+        match = re.search(r"<script>(.*?)</script>", html, re.DOTALL)
+        self.assertIsNotNone(match)
+        return match.group(1)
+
     def test_admin_state_requires_auth(self):
         status, _, _ = self.request("GET", "/admin/state", key=None)
         self.assertEqual(status, 401)
@@ -68,12 +79,66 @@ class AdminServerTests(unittest.TestCase):
         self.assertNotIn("prompt(", text)
         self.assertIn("routeSelection", text)
         self.assertIn("function openForm()", text)
-        self.assertIn("onclick=\"openForm()\"", text)
+        self.assertIn('onclick="openForm()"', text)
         self.assertIn("价格（可选", text)
-        self.assertIn("parsePricing()", text)
+        self.assertIn('id="pricingModel"', text)
+        self.assertIn("输入价格", text)
+        self.assertIn("输出价格", text)
+        self.assertIn("缓存读取价格", text)
+        self.assertIn("applyPricingFields()", text)
+        self.assertNotIn("parsePricing()", text)
         self.assertIn("provider_pricing", text)
         self.assertIn("setInterval", text)
+        self.assertIn("function el(id)", text)
+        self.assertIn("const routeProviderEl=el('routeProvider')", text)
+        self.assertIn("const routeModelEl=el('routeModel')", text)
+        self.assertIn("el('searchBox').value", text)
+        self.assertIn("el('activeTitle').textContent", text)
+        self.assertIn("el('configPath').textContent", text)
+        self.assertIn("el('providers').innerHTML", text)
+        self.assertIn("el('drawer').classList.add('show')", text)
+        self.assertIn("el('drawerBackdrop').classList.add('show')", text)
+        self.assertIn("el('providerId').value", text)
+        self.assertIn("el('baseUrl').value", text)
+        self.assertIn("el('models').value", text)
+        self.assertIn("const pricingModelEl=el('pricingModel')", text)
+        self.assertIn("oninput=\"refreshPricingModels(el('pricingModel').value)\"", text)
+        self.assertIn("el('pricingInput').value", text)
+        self.assertNotIn("routeProvider?.value", text)
+        self.assertNotIn("searchBox.value", text)
+        self.assertNotIn("activeTitle.textContent", text)
+        self.assertNotIn("providers.innerHTML", text)
+        self.assertNotIn("providerId.value", text)
+        self.assertNotIn("models.value", text)
+        self.assertNotIn("pricingModel.value", text)
         self.assertNotIn("sk-initial", text)
+
+    def test_admin_normalize_models_script_is_valid_and_node_checkable(self):
+        script = self.extract_admin_script()
+        self.assertIn("function normalizeModels()", script)
+        self.assertNotIn("split(/\n+/)", script)
+        self.assertNotIn("split(/\\n+/)", script)
+        self.assertIn("split('\\n')", script)
+        self.assertIn(".map(x=>x.trim())", script)
+        self.assertIn(".filter(Boolean)", script)
+
+        node_path = shutil.which("node")
+        if not node_path:
+            return
+
+        script_path = Path(self.tmpdir.name) / "admin-inline-script.js"
+        script_path.write_text(script, encoding="utf-8")
+        result = subprocess.run(
+            [node_path, "--check", str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"node --check failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
     def test_add_provider_and_switch_active_model(self):
         status, _, data = self.request(
@@ -124,9 +189,41 @@ class AdminServerTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200)
+        status, _, data = self.request(
+            "POST",
+            "/admin/providers",
+            {
+                "id": "relay3",
+                "name": "Relay 3",
+                "protocol": "openai",
+                "upstream_base_url": "https://relay3.example/v1",
+                "upstream_api_key": "sk-relay3",
+                "models": ["gpt-4.1"],
+                "pricing": {"gpt-4.1": {"input_per_million": 4.0, "output_per_million": 12.0, "cache_read_per_million": 0.6}},
+            },
+        )
+        self.assertEqual(status, 200)
         state = json.loads(data.decode("utf-8"))
         self.assertEqual(state["provider_pricing"]["relay2"]["gpt-4.1"]["input_per_million"], 2.5)
+        self.assertEqual(state["provider_pricing"]["relay3"]["gpt-4.1"]["input_per_million"], 4.0)
+        self.assertNotEqual(state["provider_pricing"]["relay2"]["gpt-4.1"], state["provider_pricing"]["relay3"]["gpt-4.1"])
         self.assertNotIn("sk-relay2", data.decode("utf-8"))
+
+        status, _, data = self.request(
+            "POST",
+            "/admin/providers",
+            {
+                "id": "relay2",
+                "name": "Relay 2",
+                "protocol": "openai",
+                "upstream_base_url": "https://relay2.example/v1",
+                "models": ["gpt-4.1"],
+                "pricing": {},
+            },
+        )
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertNotIn("relay2", state["provider_pricing"])
 
     def test_invalid_provider_payload_returns_400(self):
         status, _, data = self.request(
@@ -168,7 +265,6 @@ class AdminServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         state = json.loads(data.decode("utf-8"))
         self.assertNotIn("claude-opus-4-7", state["model_routes"])
-
 
     def test_primary_route_binding_api_updates_state(self):
         status, _, _ = self.request(
@@ -213,6 +309,20 @@ class AdminServerTests(unittest.TestCase):
 
         with self.assertNoLogs(logger, level="INFO"):
             status, _, _ = self.request("GET", "/admin/state")
+        self.assertEqual(status, 200)
+
+        with self.assertNoLogs(logger, level="INFO"):
+            status, _, _ = self.request(
+                "GET",
+                "/admin/usage/summary?start=2026-05-09T10:30:00Z&end=2026-05-09T11:30:00Z",
+            )
+        self.assertEqual(status, 200)
+
+        with self.assertNoLogs(logger, level="INFO"):
+            status, _, _ = self.request(
+                "GET",
+                "/admin/usage/history?limit=20&start=2026-05-09T10:30:00Z&end=2026-05-09T11:30:00Z",
+            )
         self.assertEqual(status, 200)
 
     def test_admin_url_uses_localhost_for_loopback(self):
