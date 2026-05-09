@@ -392,9 +392,22 @@ def parse_tool_arguments(value: Any) -> dict[str, Any]:
 
 
 def convert_usage(usage: dict[str, Any]) -> dict[str, int]:
+    usage = usage if isinstance(usage, dict) else {}
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+    cache_read = prompt_details.get("cached_tokens")
+    if cache_read in (None, ""):
+        cache_read = prompt_details.get("cache_read_tokens")
+    cache_write = prompt_details.get("cache_creation_tokens")
+    if cache_write in (None, ""):
+        cache_write = prompt_details.get("cache_write_tokens")
+    if cache_write in (None, ""):
+        cache_write = completion_details.get("cache_write_tokens")
     return {
         "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+        "cache_read_input_tokens": int(cache_read or 0),
+        "cache_write_input_tokens": int(cache_write or 0),
     }
 
 

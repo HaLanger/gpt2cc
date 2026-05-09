@@ -69,7 +69,10 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(anthropic["stop_reason"], "tool_use")
         self.assertEqual(anthropic["content"][0]["name"], "Bash")
         self.assertEqual(anthropic["content"][0]["input"], {"command": "ls"})
-        self.assertEqual(anthropic["usage"], {"input_tokens": 10, "output_tokens": 5})
+        self.assertEqual(
+            anthropic["usage"],
+            {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0, "cache_write_input_tokens": 0},
+        )
 
     def test_tool_result_maps_to_openai_tool_message(self):
         payload, _ = transform_anthropic_to_openai(

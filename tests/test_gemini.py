@@ -37,23 +37,25 @@ class GeminiTests(unittest.TestCase):
         _, ctx = transform_anthropic_to_gemini({"model": "claude", "messages": []}, Config(model="gemini"))
         response = {
             "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
-            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3},
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "cachedContentTokenCount": 5},
         }
         message = anthropic_message_from_gemini(response, ctx)
         self.assertEqual(message["content"], [{"type": "text", "text": "hi"}])
         self.assertEqual(message["stop_reason"], "end_turn")
-        self.assertEqual(message["usage"], {"input_tokens": 2, "output_tokens": 3})
+        self.assertEqual(message["usage"], {"input_tokens": 2, "output_tokens": 3, "cache_read_input_tokens": 5, "cache_write_input_tokens": 0})
 
     def test_stream_gemini_to_anthropic(self):
         _, ctx = transform_anthropic_to_gemini({"model": "claude", "messages": []}, Config(model="gemini"))
-        chunk = {"candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}]}
+        chunk = {"candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3}}
         output = []
         raw = f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-        stream_gemini_to_anthropic(io.BytesIO(raw), ctx, output.append)
+        result = stream_gemini_to_anthropic(io.BytesIO(raw), ctx, output.append)
         body = b"".join(output).decode("utf-8")
         self.assertIn("message_start", body)
         self.assertIn("hi", body)
         self.assertIn("message_stop", body)
+        self.assertEqual(result.usage["input_tokens"], 2)
+        self.assertEqual(result.usage["output_tokens"], 3)
 
 
 if __name__ == "__main__":

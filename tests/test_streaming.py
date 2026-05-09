@@ -25,7 +25,7 @@ class StreamingTests(unittest.TestCase):
             )
         )
         chunks = []
-        stream_openai_to_anthropic(
+        result = stream_openai_to_anthropic(
             upstream,
             TransformContext(requested_model="claude-test", upstream_model="gpt-test"),
             chunks.append,
@@ -38,6 +38,8 @@ class StreamingTests(unittest.TestCase):
         self.assertIn('"stop_reason":"end_turn"', text)
         self.assertIn("event: message_stop", text)
         self.assertNotIn("[DONE]", text)
+        self.assertEqual(result.usage["input_tokens"], 7)
+        self.assertEqual(result.usage["output_tokens"], 2)
 
     def test_tool_stream(self):
         upstream = io.BytesIO(
@@ -85,12 +87,34 @@ class StreamingTests(unittest.TestCase):
         ctx = TransformContext(requested_model="claude-test", upstream_model="gpt-test")
         ctx.tool_name_from_upstream["Bash"] = "Bash"
         chunks = []
-        stream_openai_to_anthropic(upstream, ctx, chunks.append)
+        result = stream_openai_to_anthropic(upstream, ctx, chunks.append)
         text = b"".join(chunks).decode("utf-8")
         self.assertIn('"type":"tool_use"', text)
         self.assertIn('"name":"Bash"', text)
         self.assertIn('"type":"input_json_delta","partial_json":"{\\"command\\":\\"pwd\\"}"', text)
         self.assertIn('"stop_reason":"tool_use"', text)
+        self.assertEqual(result.stop_reason, "tool_use")
+
+    def test_stream_usage_includes_cache_fields(self):
+        upstream = io.BytesIO(
+            b"".join(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]}),
+                    sse({
+                        "choices": [{"delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 4,
+                            "prompt_tokens_details": {"cached_tokens": 3, "cache_creation_tokens": 2},
+                        },
+                    }),
+                    b"data: [DONE]\n\n",
+                ]
+            )
+        )
+        result = stream_openai_to_anthropic(upstream, TransformContext(requested_model="claude-test", upstream_model="gpt-test"), [].append)
+        self.assertEqual(result.usage["cache_read_input_tokens"], 3)
+        self.assertEqual(result.usage["cache_write_input_tokens"], 2)
 
 
 if __name__ == "__main__":

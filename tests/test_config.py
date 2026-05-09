@@ -5,7 +5,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gpt2cc.config import Config, ConfigStore, ensure_config_file, load_config, normalize_provider
+from gpt2cc.config import (
+    Config,
+    ConfigStore,
+    ensure_config_file,
+    load_config,
+    normalize_provider,
+    parse_provider_pricing_value,
+    stats_path_from_config_path,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -94,6 +102,52 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(relay["upstream_api_key"], "***")
         self.assertTrue(relay["has_api_key"])
         self.assertEqual(store.snapshot().providers[-1]["upstream_api_key"], "sk-secret")
+    def test_config_store_saves_provider_pricing_by_provider_and_model(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                store = ConfigStore(load_config())
+                state = store.add_or_update_provider(
+                    {
+                        "id": "relay-a",
+                        "name": "Relay A",
+                        "upstream_base_url": "https://a.example/v1",
+                        "upstream_api_key": "sk-a",
+                        "models": ["gpt-4.1"],
+                        "pricing": {"gpt-4.1": {"input_per_million": 2.5, "output_per_million": 10.0}},
+                    }
+                )
+                state = store.add_or_update_provider(
+                    {
+                        "id": "relay-b",
+                        "name": "Relay B",
+                        "upstream_base_url": "https://b.example/v1",
+                        "upstream_api_key": "sk-b",
+                        "models": ["gpt-4.1"],
+                        "pricing": {"gpt-4.1": {"input_per_million": 4.0, "output_per_million": 12.0}},
+                    }
+                )
+        self.assertEqual(state["provider_pricing"]["relay-a"]["gpt-4.1"]["input_per_million"], 2.5)
+        self.assertEqual(state["provider_pricing"]["relay-b"]["gpt-4.1"]["input_per_million"], 4.0)
+
+    def test_config_store_empty_provider_pricing_clears_provider_prices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Config(
+                config_path=str(Path(tmpdir) / "config.json"),
+                provider_pricing={"relay": {"gpt-4.1": {"input_per_million": 2.5}}},
+            )
+            store = ConfigStore(config)
+            state = store.add_or_update_provider(
+                {
+                    "id": "relay",
+                    "name": "Relay",
+                    "upstream_base_url": "https://relay.example/v1",
+                    "models": ["gpt-4.1"],
+                    "pricing": {},
+                }
+            )
+        self.assertNotIn("relay", state["provider_pricing"])
+
     def test_config_store_state_places_active_provider_first(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.json"
@@ -279,6 +333,47 @@ class ConfigTests(unittest.TestCase):
             seen = store.state()["seen_models"]["claude-sonnet-4-6"]
         self.assertEqual(seen["count"], 2)
         self.assertTrue(seen["last_seen"])
+
+
+    def test_stats_path_default_and_custom_derivation(self):
+        self.assertEqual(stats_path_from_config_path("gpt2cc.config.json"), "gpt2cc.stats.json")
+        self.assertEqual(
+            stats_path_from_config_path(str(Path("/tmp") / "custom-config.json")),
+            str(Path("/tmp") / "custom-config.stats.json"),
+        )
+
+    def test_provider_pricing_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "relay.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "provider_pricing": {
+                            "xlab": {
+                                "gpt-5.4": {
+                                    "input_per_million": 2.5,
+                                    "output_per_million": 10.0,
+                                    "cache_read_per_million": 0.3,
+                                }
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GPT2CC_CONFIG": str(config_path)}, clear=True):
+                config = load_config()
+                self.assertEqual(config.stats_path, str(Path(tmpdir) / "relay.stats.json"))
+                self.assertEqual(config.provider_pricing["xlab"]["gpt-5.4"]["input_per_million"], 2.5)
+                store = ConfigStore(config)
+                store.save()
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["provider_pricing"]["xlab"]["gpt-5.4"]["output_per_million"], 10.0)
+        self.assertNotIn("stats_path", saved)
+
+    def test_parse_provider_pricing_rejects_invalid_values(self):
+        with self.assertRaisesRegex(ValueError, "pricing field input_per_million"):
+            parse_provider_pricing_value({"xlab": {"gpt-5.4": {"input_per_million": "abc"}}})
 
 
 if __name__ == "__main__":

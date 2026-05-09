@@ -116,6 +116,13 @@ http://127.0.0.1:3456/admin
 
 管理界面可以添加多个中转站，并为每个中转站维护协议、Base URL、API key 和可用模型列表。切换中转站或模型后，不需要重启代理；新的 `/v1/messages` 请求会立即使用当前选择，已经开始的流式请求会继续使用它开始时的配置。
 
+管理界面还内置了 Usage Dashboard：
+
+- 顶部卡片显示 input/output tokens、cache read/write、cache hit rate 和总成本
+- 图表按 `upstream_model` 合并展示，便于把同名模型跨 provider 的使用量看在一起
+- 成本和 pricing 仍按 `provider_id + upstream_model` 分开统计，因此相同模型在不同 provider 上的价格不会被混淆
+- `/admin/state` 仍保持轻量；统计数据通过专用接口单独拉取：`/admin/usage/summary` 和 `/admin/usage/history`
+
 协议含义：
 
 - `OpenAI-compatible`：当前最完整路径，支持聊天、工具调用，以及 `gpt-image-2` 等 Images API 生图/参考图编辑。

@@ -14,6 +14,7 @@ from typing import Any
 
 TRUTHY = {"1", "true", "yes", "y", "on"}
 DEFAULT_CONFIG_PATH = "gpt2cc.config.json"
+DEFAULT_STATS_PATH = "gpt2cc.stats.json"
 PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 SUPPORTED_PROTOCOLS = {"openai", "anthropic", "gemini"}
 
@@ -197,6 +198,54 @@ def _cfg(data: dict[str, Any], key: str, env_name: str, default: Any = None) -> 
     return data.get(key, default)
 
 
+def stats_path_from_config_path(config_path: str | Path) -> str:
+    path = Path(config_path)
+    if path.name == DEFAULT_CONFIG_PATH:
+        return str(path.with_name(DEFAULT_STATS_PATH))
+    return str(path.with_name(f"{path.stem}.stats.json"))
+
+
+def _parse_price_field(value: Any, field_name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"pricing field {field_name} must be numeric") from exc
+
+
+def parse_provider_pricing_value(value: Any) -> dict[str, dict[str, dict[str, float]]]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict):
+        raise ValueError("provider_pricing must be an object")
+
+    pricing: dict[str, dict[str, dict[str, float]]] = {}
+    for provider_id, models in value.items():
+        provider_key = str(provider_id).strip()
+        if not provider_key:
+            continue
+        if not isinstance(models, dict):
+            raise ValueError("provider_pricing provider entry must be an object")
+        model_prices: dict[str, dict[str, float]] = {}
+        for model_name, fields in models.items():
+            model_key = str(model_name).strip()
+            if not model_key:
+                continue
+            if not isinstance(fields, dict):
+                raise ValueError("provider_pricing model entry must be an object")
+            normalized: dict[str, float] = {}
+            for field_name in ("input_per_million", "output_per_million", "cache_read_per_million"):
+                if field_name not in fields or fields[field_name] in (None, ""):
+                    continue
+                normalized[field_name] = _parse_price_field(fields[field_name], field_name)
+            model_prices[model_key] = normalized
+        pricing[provider_key] = model_prices
+    return pricing
+
+
+
+
 @dataclass(slots=True)
 class ModelRoute:
     requested: str
@@ -255,7 +304,9 @@ class Config:
     providers: list[dict[str, Any]] = field(default_factory=list)
     active_provider: str = "default"
     active_model: str = ""
+    provider_pricing: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     config_path: str = DEFAULT_CONFIG_PATH
+    stats_path: str = DEFAULT_STATS_PATH
 
     def active_provider_label(self) -> str:
         provider = next((p for p in self.providers if p.get("id") == self.active_provider), None)
@@ -369,8 +420,10 @@ class Config:
             "image_max_reference_images": self.image_max_reference_images,
             "active_provider": self.active_provider,
             "active_model": self.active_model,
+            "provider_pricing": copy.deepcopy(self.provider_pricing),
             "providers": redacted_providers(self.providers),
             "config_path": self.config_path,
+            "stats_path": self.stats_path,
         }
 
 
@@ -484,9 +537,11 @@ def copy_config(config: Config) -> Config:
         model_map=dict(config.model_map),
         model_routes=copy.deepcopy(config.model_routes),
         seen_models=copy.deepcopy(config.seen_models),
+        provider_pricing=copy.deepcopy(config.provider_pricing),
         extra_headers=dict(config.extra_headers),
         image_models=list(config.image_models),
         providers=copy.deepcopy(config.providers),
+        stats_path=config.stats_path,
     )
 
 
@@ -542,8 +597,10 @@ class ConfigStore:
                 "model_routes": copy.deepcopy(self._config.model_routes),
                 "primary_route_model": self._config.primary_route_model,
                 "seen_models": copy.deepcopy(self._config.seen_models),
+                "provider_pricing": copy.deepcopy(self._config.provider_pricing),
                 "providers": providers,
                 "config_path": self._config.config_path,
+                "stats_path": self._config.stats_path,
                 "auth_required": bool(self._config.proxy_api_key),
             }
 
@@ -555,7 +612,14 @@ class ConfigStore:
             providers.append(provider)
             active_provider = self._config.active_provider
             active_model = self._config.active_model
-            config = replace(self._config, providers=providers)
+            pricing = copy.deepcopy(self._config.provider_pricing)
+            if "pricing" in payload:
+                provider_pricing = parse_provider_pricing_value({provider["id"]: payload.get("pricing")})
+                if provider_pricing.get(provider["id"]):
+                    pricing[provider["id"]] = provider_pricing[provider["id"]]
+                else:
+                    pricing.pop(provider["id"], None)
+            config = replace(self._config, providers=providers, provider_pricing=pricing)
             if not active_provider or active_provider == provider["id"]:
                 active_provider = provider["id"]
                 active_model = active_model or (provider["models"][0] if provider["models"] else self._config.model)
@@ -571,7 +635,9 @@ class ConfigStore:
                 raise ValueError("provider not found")
             if not providers:
                 raise ValueError("at least one provider is required")
-            config = replace(self._config, providers=providers)
+            pricing = copy.deepcopy(self._config.provider_pricing)
+            pricing.pop(provider_id, None)
+            config = replace(self._config, providers=providers, provider_pricing=pricing)
             if self._config.active_provider == provider_id:
                 provider = providers[0]
                 model = provider["models"][0] if provider.get("models") else self._config.model
@@ -712,6 +778,7 @@ def config_to_json(config: Config) -> dict[str, Any]:
         "active_provider": config.active_provider,
         "active_model": config.active_model,
         "providers": config.providers,
+        "provider_pricing": copy.deepcopy(config.provider_pricing),
     }
 
 
@@ -826,7 +893,9 @@ def load_config() -> Config:
         image_max_reference_images=int(
             _cfg(file_config, "image_max_reference_images", "GPT2CC_IMAGE_MAX_REFERENCE_IMAGES", 16)
         ),
+        provider_pricing=parse_provider_pricing_value(file_config.get("provider_pricing")),
         config_path=config_path,
+        stats_path=stats_path_from_config_path(config_path),
     )
 
     if config.upstream_protocol not in SUPPORTED_PROTOCOLS:

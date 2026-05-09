@@ -43,6 +43,15 @@
       "upstream_gemini_stream_path": "/models/{model}:streamGenerateContent"
     }
   ],
+  "provider_pricing": {
+    "main-relay": {
+      "gpt-4.1": {
+        "input_per_million": 2.5,
+        "output_per_million": 10.0,
+        "cache_read_per_million": 0.3
+      }
+    }
+  },
   "proxy_api_key": "local-claude-code-key",
   "upstream_ssl_verify": true,
   "upstream_ca_bundle": "",

@@ -4,6 +4,7 @@ import base64
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable
 
 from .config import Config
@@ -13,6 +14,12 @@ from .upstream import build_headers, open_stream_url, post_json_url
 
 
 Writer = Callable[[bytes], None]
+
+
+@dataclass(slots=True)
+class GeminiStreamResult:
+    usage: dict[str, int]
+    stop_reason: str
 
 
 def transform_anthropic_to_gemini(request: dict[str, Any], config: Config) -> tuple[dict[str, Any], TransformContext]:
@@ -212,13 +219,16 @@ def map_gemini_finish_reason(reason: Any, has_tool_call: bool) -> str:
 
 
 def convert_gemini_usage(usage: dict[str, Any]) -> dict[str, int]:
+    usage = usage if isinstance(usage, dict) else {}
     return {
         "input_tokens": int(usage.get("promptTokenCount") or 0),
         "output_tokens": int(usage.get("candidatesTokenCount") or 0),
+        "cache_read_input_tokens": int(usage.get("cachedContentTokenCount") or usage.get("cacheReadInputTokenCount") or 0),
+        "cache_write_input_tokens": int(usage.get("cacheWriteInputTokenCount") or 0),
     }
 
 
-def stream_gemini_to_anthropic(response: BinaryIO, ctx: TransformContext, writer: Writer) -> None:
+def stream_gemini_to_anthropic(response: BinaryIO, ctx: TransformContext, writer: Writer) -> GeminiStreamResult:
     message_id = f"msg_{uuid.uuid4().hex}"
     writer(encode_sse("message_start", new_message_start(ctx, message_id)))
     text_index: int | None = None
@@ -256,6 +266,7 @@ def stream_gemini_to_anthropic(response: BinaryIO, ctx: TransformContext, writer
     converted_usage = convert_gemini_usage(usage)
     writer(encode_sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": converted_usage["output_tokens"]}}))
     writer(encode_sse("message_stop", {"type": "message_stop"}))
+    return GeminiStreamResult(usage=converted_usage, stop_reason=stop_reason)
 
 
 def iter_gemini_chunks(response: BinaryIO):

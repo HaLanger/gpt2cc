@@ -15,6 +15,12 @@ LOG = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
+class StreamResult:
+    usage: dict[str, int]
+    stop_reason: str
+
+
+@dataclass(slots=True)
 class ToolStreamState:
     content_index: int
     id: str = ""
@@ -137,7 +143,7 @@ class StreamState:
             self.send("content_block_stop", {"type": "content_block_stop", "index": state.content_index})
         self.tool_states.clear()
 
-    def stop(self) -> None:
+    def stop(self) -> StreamResult:
         self.ensure_message_start()
         self.close_text_block()
         self.close_tool_blocks()
@@ -158,9 +164,10 @@ class StreamState:
             self.tool_delta_count,
             stop_reason,
         )
+        return StreamResult(usage=usage, stop_reason=stop_reason)
 
 
-def stream_openai_to_anthropic(response: BinaryIO, ctx: TransformContext, writer: Writer) -> None:
+def stream_openai_to_anthropic(response: BinaryIO, ctx: TransformContext, writer: Writer) -> StreamResult:
     state = StreamState(ctx=ctx, writer=writer)
     for data in iter_sse_data(response):
         if data == "[DONE]":
@@ -189,4 +196,4 @@ def stream_openai_to_anthropic(response: BinaryIO, ctx: TransformContext, writer
             upstream_index = int(tool_delta.get("index") or 0)
             state.write_tool_delta(upstream_index, tool_delta)
 
-    state.stop()
+    return state.stop()

@@ -8,11 +8,13 @@ import os
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
 from . import __version__
 from .anthropic_upstream import (
     build_anthropic_payload,
+    extract_anthropic_usage_from_message,
     open_anthropic_stream,
     post_anthropic_message,
     stream_anthropic_passthrough,
@@ -31,14 +33,16 @@ from .image import (
     build_image_generation_payload,
     edit_image,
     generate_image,
+    image_usage,
     is_image_model,
     request_has_reference_images,
     stream_image_result_to_anthropic,
 )
 from .streaming import stream_openai_to_anthropic
 from .tokens import estimate_tokens
-from .transform import anthropic_message_from_openai, transform_anthropic_to_openai
+from .transform import anthropic_message_from_openai, convert_usage, transform_anthropic_to_openai
 from .upstream import UpstreamError, open_stream_with_retry, post_json
+from .usage_stats import UsagePrice, append_usage_record, build_usage_record, load_usage_stats, summarize_usage_records, usage_record_to_dict
 
 
 LOG = logging.getLogger(__name__)
@@ -80,9 +84,21 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                     self._require_auth()
                     self._send_html(admin_html(store.state()))
                     return
+                if path == "/admin/usage":
+                    self._require_auth()
+                    self._send_html(usage_html(store.state()))
+                    return
                 if path == "/admin/state":
                     self._require_auth()
                     self._send_json(store.state())
+                    return
+                if path == "/admin/usage/summary":
+                    self._require_auth()
+                    self._send_json(self._usage_summary_payload())
+                    return
+                if path == "/admin/usage/history":
+                    self._require_auth()
+                    self._send_json(self._usage_history_payload(self._parse_limit()))
                     return
                 if path == "/debug/config":
                     self._require_auth()
@@ -196,6 +212,56 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 return
             self._handle_openai_messages(request, request_config)
 
+        def _provider_name(self, request_config: Config) -> str:
+            for provider in request_config.providers:
+                if provider.get("id") == request_config.active_provider:
+                    return str(provider.get("name") or provider.get("id") or request_config.active_provider)
+            return request_config.active_provider or ""
+
+        def _usage_price(self, request_config: Config, upstream_model: str) -> UsagePrice | None:
+            provider_id = str(request_config.active_provider or "")
+            prices = request_config.provider_pricing.get(provider_id) or {}
+            fields = prices.get(upstream_model) or {}
+            if not fields:
+                return None
+            return UsagePrice(
+                provider_id=provider_id,
+                model=upstream_model,
+                input_per_million=fields.get("input_per_million"),
+                output_per_million=fields.get("output_per_million"),
+                cache_read_per_million=fields.get("cache_read_per_million"),
+            )
+
+        def _record_usage(
+            self,
+            request: dict[str, Any],
+            request_config: Config,
+            endpoint: str,
+            stream: bool,
+            usage: dict[str, int],
+            upstream_model: str,
+            route_source: str | None = None,
+        ) -> None:
+            try:
+                record = build_usage_record(
+                    protocol=request_config.upstream_protocol,
+                    requested_model=str(request.get("model") or ""),
+                    provider_id=str(request_config.active_provider or ""),
+                    provider_name=self._provider_name(request_config),
+                    upstream_model=upstream_model,
+                    route_source=route_source or request_config.resolve_model_route(str(request.get("model") or "")).source,
+                    stream=stream,
+                    endpoint=endpoint,
+                    input_tokens=int(usage.get("input_tokens") or 0),
+                    output_tokens=int(usage.get("output_tokens") or 0),
+                    cache_read_input_tokens=int(usage.get("cache_read_input_tokens") or 0),
+                    cache_write_input_tokens=int(usage.get("cache_write_input_tokens") or 0),
+                    price=self._usage_price(request_config, upstream_model),
+                )
+                append_usage_record(request_config.stats_path, record)
+            except Exception as exc:
+                LOG.warning("could not persist usage stats: %s", exc)
+
         def _handle_anthropic_messages(self, request: dict[str, Any], request_config: Config) -> None:
             upstream_payload = build_anthropic_payload(request, request_config)
             LOG.info(
@@ -210,10 +276,13 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 upstream_stream = open_anthropic_stream(request_config, upstream_payload)
                 self._send_stream_headers()
                 with upstream_stream as response:
-                    stream_anthropic_passthrough(response, self._write_stream)
+                    stream_result = stream_anthropic_passthrough(response, self._write_stream)
+                self._record_usage(request, request_config, "anthropic/messages", True, stream_result.usage, str(upstream_payload.get("model") or ""))
                 return
             upstream_response = post_anthropic_message(request_config, upstream_payload)
-            self._send_json(upstream_response.json())
+            data = upstream_response.json()
+            self._send_json(data)
+            self._record_usage(request, request_config, "anthropic/messages", False, extract_anthropic_usage_from_message(data), str(upstream_payload.get("model") or ""))
 
         def _handle_gemini_messages(self, request: dict[str, Any], request_config: Config) -> None:
             upstream_payload, ctx = transform_anthropic_to_gemini(request, request_config)
@@ -232,10 +301,14 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 upstream_stream = open_gemini_stream(request_config, upstream_payload)
                 self._send_stream_headers()
                 with upstream_stream as response:
-                    stream_gemini_to_anthropic(response, ctx, self._write_stream)
+                    stream_result = stream_gemini_to_anthropic(response, ctx, self._write_stream)
+                self._record_usage(request, request_config, "gemini/generateContent", True, stream_result.usage, ctx.upstream_model)
                 return
             upstream_response = post_gemini(request_config, upstream_payload)
-            self._send_json(anthropic_message_from_gemini(upstream_response.json(), ctx))
+            data = upstream_response.json()
+            self._send_json(anthropic_message_from_gemini(data, ctx))
+            from .gemini import convert_gemini_usage
+            self._record_usage(request, request_config, "gemini/generateContent", False, convert_gemini_usage(data.get("usageMetadata") or {}), ctx.upstream_model)
 
         def _handle_openai_messages(self, request: dict[str, Any], request_config: Config) -> None:
             upstream_payload, ctx = transform_anthropic_to_openai(request, request_config)
@@ -267,16 +340,19 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
 
                     if upstream_payload.get("stream"):
                         self._send_stream_headers()
-                        stream_image_result_to_anthropic(
+                        stream_result = stream_image_result_to_anthropic(
                             lambda: edit_image(request_config, edit_request, ctx),
                             ctx,
                             self._write_stream,
                             f"Calling image edit model {ctx.upstream_model} with {edit_request.reference_count} reference image(s)...\n\n",
                         )
+                        if stream_result.succeeded:
+                            self._record_usage(request, request_config, endpoint, True, stream_result.usage, ctx.upstream_model)
                         return
 
                     result = edit_image(request_config, edit_request, ctx)
                     self._send_json(anthropic_message_from_image_result(result, ctx))
+                    self._record_usage(request, request_config, endpoint, False, image_usage(result.raw_response), ctx.upstream_model)
                     return
 
                 image_payload = build_image_generation_payload(request, request_config, ctx)
@@ -287,16 +363,19 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
 
                 if upstream_payload.get("stream"):
                     self._send_stream_headers()
-                    stream_image_result_to_anthropic(
+                    stream_result = stream_image_result_to_anthropic(
                         lambda: generate_image(request_config, image_payload, ctx),
                         ctx,
                         self._write_stream,
                         f"Calling image generation model {ctx.upstream_model}...\n\n",
                     )
+                    if stream_result.succeeded:
+                        self._record_usage(request, request_config, endpoint, True, stream_result.usage, ctx.upstream_model)
                     return
 
                 result = generate_image(request_config, image_payload, ctx)
                 self._send_json(anthropic_message_from_image_result(result, ctx))
+                self._record_usage(request, request_config, endpoint, False, image_usage(result.raw_response), ctx.upstream_model)
                 return
 
             LOG.info(
@@ -316,18 +395,138 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
                 upstream_stream = open_stream_with_retry(request_config, upstream_payload)
                 self._send_stream_headers()
                 with upstream_stream as response:
-                    stream_openai_to_anthropic(response, ctx, self._write_stream)
+                    stream_result = stream_openai_to_anthropic(response, ctx, self._write_stream)
+                self._record_usage(request, request_config, "chat/completions", True, stream_result.usage, ctx.upstream_model)
                 return
 
             upstream_response = post_json(request_config, upstream_payload)
             data = upstream_response.json()
             result = anthropic_message_from_openai(data, ctx)
             self._send_json(result)
+            self._record_usage(request, request_config, "chat/completions", False, convert_usage(data.get("usage") or {}), ctx.upstream_model)
 
         def _handle_count_tokens(self) -> None:
             self._require_auth()
             request = self._read_json(store.snapshot())
             self._send_json({"input_tokens": estimate_tokens(request)})
+
+        def _parse_limit(self, default: int = 50, maximum: int = 500) -> int:
+            query = parse_qs(urlsplit(self.path).query)
+            raw = (query.get("limit") or [str(default)])[0]
+            try:
+                value = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("limit must be an integer") from exc
+            return max(1, min(maximum, value))
+
+        def _usage_summary_payload(self) -> dict[str, Any]:
+            stats_path = store.snapshot().stats_path
+            records = load_usage_stats(stats_path).records or []
+            summary = summarize_usage_records(records)
+            total_cost = 0.0
+            priced_records = 0
+            merged_models: dict[str, dict[str, Any]] = {}
+            provider_models: dict[tuple[str, str], dict[str, Any]] = {}
+            for record in records:
+                model_key = record.upstream_model or "<unknown>"
+                merged = merged_models.setdefault(
+                    model_key,
+                    {
+                        "upstream_model": model_key,
+                        "records": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "providers": set(),
+                    },
+                )
+                merged["records"] += 1
+                merged["input_tokens"] += record.input_tokens
+                merged["output_tokens"] += record.output_tokens
+                merged["cache_read_input_tokens"] += record.cache_read_input_tokens
+                merged["cache_write_input_tokens"] += record.cache_write_input_tokens
+                merged["providers"].add(record.provider_id or record.provider_name or "")
+
+                provider_key = (record.provider_id or "", model_key)
+                item = provider_models.setdefault(
+                    provider_key,
+                    {
+                        "provider_id": record.provider_id,
+                        "provider_name": record.provider_name,
+                        "upstream_model": model_key,
+                        "records": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "cache_hit_rate": None,
+                        "total_cost": 0.0,
+                        "has_pricing": False,
+                        "pricing": None,
+                    },
+                )
+                item["records"] += 1
+                item["input_tokens"] += record.input_tokens
+                item["output_tokens"] += record.output_tokens
+                item["cache_read_input_tokens"] += record.cache_read_input_tokens
+                item["cache_write_input_tokens"] += record.cache_write_input_tokens
+                if record.price is not None:
+                    item["has_pricing"] = True
+                    item["pricing"] = {
+                        "input_per_million": record.price.input_per_million,
+                        "output_per_million": record.price.output_per_million,
+                        "cache_read_per_million": record.price.cache_read_per_million,
+                    }
+                if record.cost is not None:
+                    item["total_cost"] += record.cost.total
+                    total_cost += record.cost.total
+                    priced_records += 1
+
+            merged_list = []
+            for item in merged_models.values():
+                providers = sorted(value for value in item.pop("providers") if value)
+                item["provider_count"] = len(providers)
+                item["providers"] = providers
+                item["cache_hit_rate"] = _cache_hit_rate(item["input_tokens"], item["cache_read_input_tokens"])
+                merged_list.append(item)
+            merged_list.sort(key=lambda item: (-int(item["input_tokens"] + item["output_tokens"]), str(item["upstream_model"])))
+
+            provider_list = []
+            for item in provider_models.values():
+                item["cache_hit_rate"] = _cache_hit_rate(item["input_tokens"], item["cache_read_input_tokens"])
+                provider_list.append(item)
+            provider_list.sort(key=lambda item: (-float(item["total_cost"]), str(item["provider_id"]), str(item["upstream_model"])))
+
+            return {
+                "stats_path": stats_path,
+                "records": len(records),
+                "totals": {
+                    "records": summary.records,
+                    "input_tokens": summary.input_tokens,
+                    "output_tokens": summary.output_tokens,
+                    "cache_read_input_tokens": summary.cache_read_input_tokens,
+                    "cache_write_input_tokens": summary.cache_write_input_tokens,
+                    "cache_hit_rate": summary.cache_hit_rate,
+                    "total_cost": total_cost if priced_records else None,
+                    "priced_records": priced_records,
+                    "has_pricing": bool(priced_records),
+                },
+                "merged_by_model": merged_list,
+                "provider_model_breakdown": provider_list,
+            }
+
+        def _usage_history_payload(self, limit: int) -> dict[str, Any]:
+            stats_path = store.snapshot().stats_path
+            records = load_usage_stats(stats_path).records or []
+            recent = list(reversed(records[-limit:]))
+            return {
+                "stats_path": stats_path,
+                "records": [usage_record_to_dict(record) for record in recent],
+                "returned": len(recent),
+                "total": len(records),
+                "limit": limit,
+            }
 
         def _read_json(self, request_config: Config | None = None) -> dict[str, Any]:
             limit = (request_config or store.snapshot()).max_body_bytes
@@ -415,6 +614,13 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def _cache_hit_rate(input_tokens: int, cache_read_input_tokens: int) -> float | None:
+    denominator = int(input_tokens) + int(cache_read_input_tokens)
+    if denominator <= 0:
+        return None
+    return int(cache_read_input_tokens) / denominator
+
+
 def admin_html(state: dict[str, Any]) -> str:
     auth_hint = "true" if state.get("auth_required") else "false"
     return f"""<!doctype html>
@@ -424,7 +630,7 @@ def admin_html(state: dict[str, Any]) -> str:
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
 <title>gpt2cc relay console</title>
 <style>
-:root {{ color-scheme: light; --bg:#f6f7fb; --card:#ffffff; --text:#172033; --muted:#657086; --line:#e5e9f2; --brand:#2563eb; --brand2:#0f172a; --bad:#dc2626; --ok:#059669; }}
+:root {{ color-scheme: light; --bg:#f6f7fb; --card:#ffffff; --text:#172033; --muted:#657086; --line:#e5e9f2; --brand:#2563eb; --brand2:#0f172a; --bad:#dc2626; --ok:#059669; --warn:#b45309; }}
 * {{ box-sizing:border-box; }} body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:linear-gradient(135deg,#f8fbff,#f3f4f8); color:var(--text); }}
 .shell {{ max-width:1180px; margin:0 auto; padding:32px 20px 48px; }}
 .hero {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-start; margin-bottom:24px; }}
@@ -440,20 +646,24 @@ button {{ border:0; border-radius:12px; padding:10px 13px; font-weight:750; curs
 .route-row {{ display:grid; grid-template-columns:1.3fr .8fr .8fr auto; gap:10px; align-items:center; padding:10px; border:1px solid var(--line); border-radius:14px; background:white; margin-top:8px; }} .route-form {{ display:grid; grid-template-columns:1.2fr .8fr .8fr auto; gap:10px; align-items:end; margin-top:14px; }} .route-summary {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }} .summary-card {{ background:white; border:1px solid var(--line); border-radius:16px; padding:13px; }} .summary-card strong {{ display:block; margin-bottom:5px; }} .route-drawer {{ width:min(860px,calc(100vw - 36px)); }} .hidden {{ display:none; }} .muted {{ color:var(--muted); }}
 .name {{ font-weight:800; }} .sub {{ color:var(--muted); font-size:12px; margin-top:3px; word-break:break-all; }} .models {{ display:flex; flex-wrap:wrap; gap:5px; max-height:160px; overflow:auto; }} .model {{ border:1px solid var(--line); background:#f8fafc; border-radius:999px; padding:4px 8px; font-size:12px; }} button.model {{ color:#334155; font-weight:750; }} button.model.active-model {{ background:#dbeafe; border-color:#93c5fd; color:#1d4ed8; }} .pill {{ border-radius:999px; padding:4px 9px; background:#eef2ff; color:#1d4ed8; font-size:12px; font-weight:800; display:inline-block; margin-left:6px; }} .protocol {{ border-radius:999px; padding:3px 8px; background:#ecfdf5; color:#047857; font-size:11px; font-weight:800; display:inline-block; margin-left:6px; }} .actions {{ display:flex; gap:7px; justify-content:flex-end; flex-wrap:wrap; }} .empty {{ text-align:center; color:var(--muted); padding:32px; }}
 .drawer-backdrop {{ position:fixed; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:.18s; }} .drawer-backdrop.show {{ opacity:1; pointer-events:auto; }} .drawer {{ position:fixed; top:18px; right:18px; bottom:18px; width:min(460px,calc(100vw - 36px)); padding:20px; overflow:auto; transform:translateX(calc(100% + 28px)); transition:.2s; }} .drawer.show {{ transform:translateX(0); }} .drawer-head {{ display:flex; justify-content:space-between; align-items:center; gap:12px; }} .drawer h2 {{ margin:0; }} label {{ display:block; color:#334155; font-size:13px; font-weight:750; margin:13px 0 6px; }}
+.stats-grid {{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin:12px 0 16px; }} .stat-card {{ background:white; border:1px solid var(--line); border-radius:16px; padding:14px; }} .stat-card b {{ display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }} .stat-card strong {{ font-size:20px; display:block; }}
+.stats-layout {{ display:grid; grid-template-columns:1.4fr 1fr; gap:16px; }} .chart-list {{ display:grid; gap:10px; margin-top:12px; }} .chart-row {{ background:white; border:1px solid var(--line); border-radius:16px; padding:12px; }} .chart-head {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-end; margin-bottom:8px; }} .chart-bar {{ display:flex; height:12px; border-radius:999px; overflow:hidden; background:#eef2ff; }} .seg-input {{ background:#2563eb; }} .seg-output {{ background:#8b5cf6; }} .seg-cache-read {{ background:#10b981; }} .seg-cache-write {{ background:#f59e0b; }}
+.table-wrap {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; font-size:13px; }} th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }} th {{ color:#475569; font-weight:800; }} .inline-note {{ margin-top:10px; padding:10px 12px; border:1px dashed #cbd5e1; border-radius:14px; color:#475569; background:#f8fafc; }} .inline-note.warn {{ color:#92400e; background:#fffbeb; border-color:#fcd34d; }} .history-list {{ display:grid; gap:8px; margin-top:12px; }} .history-item {{ border:1px solid var(--line); border-radius:14px; padding:10px 12px; background:white; }} .tiny {{ font-size:12px; }}
+@media (max-width:1050px) {{ .stats-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .stats-layout {{ grid-template-columns:1fr; }} }}
 @media (max-width:900px) {{ .hero,.toolbar,.row {{ grid-template-columns:1fr; }} .actions {{ justify-content:flex-start; }} }}
 </style>
 </head>
 <body>
 <div class=\"shell\">
   <div class=\"hero\"><div><h1>gpt2cc relay console</h1><div class=\"subtitle\">管理中转站、API key 和模型，新请求会立即使用当前选择。</div></div><div class=\"status\"><small>当前主路由</small><strong id=\"activeTitle\">Loading...</strong><small id=\"configPath\"></small></div></div>
-  <div class=\"actions\" style=\"justify-content:flex-start;margin-bottom:16px\"><button class=\"primary\" onclick=\"openRoutes()\">模型路由</button><button class=\"ghost\" onclick=\"load()\">刷新状态</button></div>
+  <div class=\"actions\" style=\"justify-content:flex-start;margin-bottom:16px\"><button class=\"primary\" onclick=\"openRoutes()\">模型路由</button><button class=\"ghost\" onclick=\"location.href='/admin/usage'\">用量统计</button><button class=\"ghost\" onclick=\"load()\">刷新状态</button></div>
   <div id=\"banner\" class=\"banner\"></div>
   <div id=\"authBox\" class=\"panel auth\"><b>代理密钥</b><div class=\"muted\">此服务启用了 GPT2CC_PROXY_API_KEY。密钥只保存在本次浏览器会话。</div><div class=\"toolbar\"><input id=\"proxyKey\" type=\"password\" autocomplete=\"off\" placeholder=\"Proxy API key\"><button class=\"primary\" onclick=\"saveProxyKey()\">保存并连接</button></div></div>
   <section class=\"panel\" style=\"margin-bottom:16px\"><h2 style=\"margin:0 0 10px\">当前路由概览</h2><div id=\"routeOverview\" class=\"route-summary\"></div></section>
   <section class=\"panel\"><div class=\"toolbar\"><input id=\"searchBox\" placeholder=\"搜索中转站名称、ID、域名或模型...\" oninput=\"render()\"><button class=\"ghost\" onclick=\"clearSearch()\">清除搜索</button><button class=\"primary\" onclick=\"openForm()\">添加中转站</button></div><div id=\"providers\" class=\"list\"></div></section>
 </div>
 <div id=\"drawerBackdrop\" class=\"drawer-backdrop\" onclick=\"closeForm()\"></div>
-<aside id=\"drawer\" class=\"drawer\"><div class=\"drawer-head\"><h2 id=\"formTitle\">添加中转站</h2><button class=\"ghost\" onclick=\"closeForm()\">关闭</button></div><label>ID</label><input id=\"providerId\" placeholder=\"my-relay\"><label>名称</label><input id=\"providerName\" placeholder=\"My Relay\"><label>协议</label><select id=\"protocol\"><option value=\"openai\">OpenAI-compatible</option><option value=\"anthropic\">Anthropic Messages</option><option value=\"gemini\">Gemini native</option></select><label>Base URL</label><input id=\"baseUrl\" placeholder=\"https://relay.example.com/v1\"><label>API key</label><input id=\"apiKey\" type=\"password\" placeholder=\"编辑时留空表示保留原 key\"><label>模型（每行一个）</label><textarea id=\"models\" placeholder=\"gpt-4.1&#10;gpt-image-2\"></textarea><div class=\"actions\"><button class=\"primary\" onclick=\"saveProvider()\">保存中转站</button><button onclick=\"resetForm()\">清空</button></div><p class=\"muted\">关闭面板不会清空未保存内容；再次点“添加中转站”会继续显示。</p></aside>
+<aside id=\"drawer\" class=\"drawer\"><div class=\"drawer-head\"><h2 id=\"formTitle\">添加中转站</h2><button class=\"ghost\" onclick=\"closeForm()\">关闭</button></div><label>ID</label><input id=\"providerId\" placeholder=\"my-relay\"><label>名称</label><input id=\"providerName\" placeholder=\"My Relay\"><label>协议</label><select id=\"protocol\"><option value=\"openai\">OpenAI-compatible</option><option value=\"anthropic\">Anthropic Messages</option><option value=\"gemini\">Gemini native</option></select><label>Base URL</label><input id=\"baseUrl\" placeholder=\"https://relay.example.com/v1\"><label>API key</label><input id=\"apiKey\" type=\"password\" placeholder=\"编辑时留空表示保留原 key\"><label>模型（每行一个）</label><textarea id=\"models\" placeholder=\"gpt-4.1&#10;gpt-image-2\"></textarea><label>价格（可选，按模型填写；单位：美元 / 1M tokens）</label><textarea id=\"pricing\" placeholder='示例: gpt-4.1 input_per_million/output_per_million/cache_read_per_million'></textarea><div class=\"sub\">同名模型在不同中转站可分别设置价格；留空则不计算费用。</div><div class=\"actions\"><button class=\"primary\" onclick=\"saveProvider()\">保存中转站</button><button onclick=\"resetForm()\">清空</button></div><p class=\"muted\">关闭面板不会清空未保存内容；再次点“添加中转站”会继续显示。</p></aside>
 <aside id=\"routeDrawer\" class=\"drawer route-drawer\"><div class=\"drawer-head\"><h2>模型路由配置</h2><button class=\"ghost\" onclick=\"closeRoutes()\">关闭</button></div><div class=\"muted\">已配置路由会优先命中；未配置模型使用当前主路由。最近发现会自动刷新。</div><div class=\"route-form\"><label>Claude Code 模型<input id=\"routeRequested\" placeholder=\"claude-opus-4-7\"></label><label>中转站<select id=\"routeProvider\" onchange=\"syncRouteModels()\"></select></label><label>上游模型<select id=\"routeModel\"></select></label><button class=\"primary\" onclick=\"saveRoute()\">保存路由</button></div><h3>已配置路由</h3><div id=\"configuredRoutes\"></div><h3><button class=\"ghost\" onclick=\"toggleSeenRoutes()\">最近发现</button></h3><div id=\"seenRoutes\" class=\"hidden\"></div></aside>
 <aside id=\"primaryBindDrawer\" class=\"drawer\"><div class=\"drawer-head\"><h2>绑定主模型</h2><button class=\"ghost\" onclick=\"closePrimaryBind()\">关闭</button></div><div class=\"muted\">选择 Claude Code 默认请求的模型。绑定后，切换当前主路由会同步更新这个模型的路由。</div><div id=\"primaryBindList\" style=\"margin-top:14px\"></div></aside>
 <script>
@@ -490,16 +700,68 @@ async function savePrimaryBind(encoded) {{ try {{ await api('/admin/primary-rout
 async function unbindPrimaryRoute() {{ if(!confirm('解绑主模型？现有模型路由会保留，不再随主路由切换。')) return; try {{ await api('/admin/primary-route-model', {{method:'POST', body:JSON.stringify({{requested_model:''}})}}); await load(); show('主模型已解绑'); }} catch(e) {{ show(e.message,'err'); }} }}
 function closeRoutes() {{ routeDrawer.classList.remove('show'); if(!drawer.classList.contains('show')&&!primaryBindDrawer.classList.contains('show')) drawerBackdrop.classList.remove('show'); }}
 function toggleSeenRoutes() {{ seenRoutes.classList.toggle('hidden'); }}
-
 function openForm() {{ drawer.classList.add('show'); drawerBackdrop.classList.add('show'); }}
 function closeForm() {{ drawer.classList.remove('show'); if(!routeDrawer.classList.contains('show')&&!primaryBindDrawer.classList.contains('show')) drawerBackdrop.classList.remove('show'); }}
-function editProvider(id) {{ const p=state.providers.find(x=>x.id===id); if(!p) return; formTitle.textContent='编辑中转站'; providerId.value=p.id; providerName.value=p.name; protocol.value=p.protocol||'openai'; baseUrl.value=p.upstream_base_url; apiKey.value=''; models.value=(p.models||[]).join('\\n'); openForm(); }}
-function resetForm() {{ formTitle.textContent='添加中转站'; providerId.value=''; providerName.value=''; protocol.value='openai'; baseUrl.value=''; apiKey.value=''; models.value=''; }}
-async function saveProvider() {{ try {{ await api('/admin/providers', {{method:'POST', body:JSON.stringify({{id:providerId.value,name:providerName.value,protocol:protocol.value,upstream_base_url:baseUrl.value,upstream_api_key:apiKey.value,models:models.value.split(/\\n+/).map(x=>x.trim()).filter(Boolean)}})}}); resetForm(); closeForm(); await load(); show('中转站已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
+function editProvider(id) {{ const p=state.providers.find(x=>x.id===id); if(!p) return; formTitle.textContent='编辑中转站'; providerId.value=p.id; providerName.value=p.name; protocol.value=p.protocol||'openai'; baseUrl.value=p.upstream_base_url; apiKey.value=''; models.value=(p.models||[]).join('\\n'); pricing.value=JSON.stringify((state.provider_pricing||{{}})[p.id]||{{}}, null, 2); openForm(); }}
+function resetForm() {{ formTitle.textContent='添加中转站'; providerId.value=''; providerName.value=''; protocol.value='openai'; baseUrl.value=''; apiKey.value=''; models.value=''; pricing.value=''; }}
+function parsePricing() {{ const raw=(pricing.value||'').trim(); return raw ? JSON.parse(raw) : {{}}; }}
+async function saveProvider() {{ try {{ await api('/admin/providers', {{method:'POST', body:JSON.stringify({{id:providerId.value,name:providerName.value,protocol:protocol.value,upstream_base_url:baseUrl.value,upstream_api_key:apiKey.value,models:models.value.split(/\\n+/).map(x=>x.trim()).filter(Boolean),pricing:parsePricing()}})}}); resetForm(); closeForm(); await load(); show('中转站已保存'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function activate(id) {{ try {{ const sel=document.getElementById('sel-'+id); await activateModel(id, sel?.value||''); }} catch(e) {{ show(e.message,'err'); }} }}
 async function activateModel(id, model) {{ try {{ await api('/admin/active', {{method:'POST', body:JSON.stringify({{provider_id:id, model}})}}); await load(); show('已切换，新的请求会立即使用该配置'); }} catch(e) {{ show(e.message,'err'); }} }}
 async function deleteProvider(id) {{ if(!confirm('删除这个中转站？')) return; try {{ await api('/admin/providers/delete', {{method:'POST', body:JSON.stringify({{id}})}}); await load(); show('中转站已删除'); }} catch(e) {{ show(e.message,'err'); }} }}
 load(); setInterval(()=>load(true), 2500);
+</script>
+</body>
+</html>"""
+
+
+def usage_html(state: dict[str, Any]) -> str:
+    auth_hint = "true" if state.get("auth_required") else "false"
+    return f"""<!doctype html>
+<html lang=\"zh-CN\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<title>gpt2cc usage stats</title>
+<style>
+* {{ box-sizing:border-box; }} body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif; background:#fafafa; color:#0f172a; }}
+.top {{ height:58px; border-bottom:1px solid #e5e7eb; display:flex; align-items:center; justify-content:space-between; padding:0 22px; background:white; }} h1 {{ font-size:18px; margin:0; }} a,button {{ border:0; border-radius:10px; padding:9px 12px; background:#f1f5f9; color:#1e293b; font-weight:750; text-decoration:none; cursor:pointer; }} button.primary {{ background:#111827; color:white; }}
+.shell {{ width:min(920px,calc(100vw - 36px)); margin:20px auto 48px; }} .cards {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0 20px; }} .card,.panel {{ background:white; border:1px solid #e5e7eb; border-radius:10px; }} .card {{ padding:18px; min-height:106px; }} .label {{ color:#6b7280; font-size:12px; margin-bottom:6px; }} .value {{ font-size:24px; font-weight:850; letter-spacing:-.03em; }} .sub {{ color:#6b7280; font-size:12px; margin-top:5px; }} .panel {{ padding:16px; margin-bottom:20px; }} .panel h2 {{ margin:0 0 14px; font-size:15px; }}
+.model-row {{ display:grid; grid-template-columns:140px 1fr 64px; gap:10px; align-items:center; margin:11px 0; font-size:13px; }} .bar-track {{ height:16px; border-radius:4px; background:#eeeeee; overflow:hidden; }} .bar {{ height:100%; border-radius:4px; background:#222; }} .daily-chart {{ display:flex; gap:2px; align-items:end; height:140px; padding:12px 0 4px; }} .day {{ flex:1; min-width:10px; background:#ececec; border-radius:2px 2px 0 0; position:relative; }} .day-fill {{ position:absolute; left:0; right:0; bottom:0; background:#5b6ec1; border-radius:2px 2px 0 0; }} .day-fill.cache {{ background:#10b981; height:2px; bottom:0; }}
+table {{ width:100%; border-collapse:collapse; font-size:12px; }} th,td {{ text-align:left; padding:9px 10px; border-top:1px solid #e5e7eb; }} th {{ color:#6b7280; font-weight:750; }} .muted {{ color:#6b7280; }} .auth {{ display:none; margin:20px 0; padding:14px; }} .auth.show {{ display:block; }} input {{ border:1px solid #e5e7eb; border-radius:10px; padding:10px 12px; width:260px; max-width:100%; }} .banner {{ display:none; margin:10px 0; padding:10px 12px; border-radius:10px; background:#fee2e2; color:#991b1b; }} .banner.show {{ display:block; }}
+@media (max-width:780px) {{ .cards {{ grid-template-columns:1fr 1fr; }} .model-row {{ grid-template-columns:1fr; }} }}
+</style>
+</head>
+<body>
+<div class=\"top\"><h1>用量统计</h1><div><a href=\"/admin\">返回管理台</a> <button onclick=\"loadUsage()\">刷新</button></div></div>
+<div class=\"shell\">
+  <div id=\"authBox\" class=\"auth panel\"><b>代理密钥</b><div class=\"sub\">此页面需要 GPT2CC_PROXY_API_KEY。</div><div style=\"margin-top:10px\"><input id=\"proxyKey\" type=\"password\" placeholder=\"Proxy API key\"> <button class=\"primary\" onclick=\"saveProxyKey()\">保存并连接</button></div></div>
+  <div id=\"banner\" class=\"banner\"></div>
+  <div id=\"cards\" class=\"cards\"></div>
+  <section class=\"panel\"><h2>模型分布</h2><div id=\"modelDistribution\"></div></section>
+  <section class=\"panel\"><h2>最近 20 条请求</h2><table><thead><tr><th>时间</th><th>Provider / 模型</th><th>输入</th><th>输出</th><th>缓存命中情况</th><th>费用</th></tr></thead><tbody id=\"requestRows\"></tbody></table></section>
+  <section class=\"panel\"><h2>Provider / Model 成本明细</h2><table><thead><tr><th>Provider</th><th>模型</th><th>输入</th><th>输出</th><th>缓存读取</th><th>费用</th></tr></thead><tbody id=\"costRows\"></tbody></table><div id=\"statsPath\" class=\"sub\"></div></section>
+</div>
+<script>
+const AUTH_REQUIRED = {auth_hint};
+let summary=null, history=null;
+function key() {{ return sessionStorage.getItem('gpt2cc_proxy_key') || ''; }}
+function headers() {{ const h={{'content-type':'application/json'}}; if(key()) h['x-api-key']=key(); return h; }}
+function esc(s) {{ return String(s ?? '').replace(/[&<>\"]/g, c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}}[c])); }}
+function fmt(n) {{ const v=Number(n||0); if(v>=1000000) return (v/1000000).toFixed(v>=10000000?1:2)+'M'; if(v>=1000) return (v/1000).toFixed(1)+'K'; return v.toLocaleString('en-US'); }}
+function pct(v) {{ return v==null ? '--' : (Number(v)*100).toFixed(1)+'%'; }}
+function money(v) {{ return v==null ? '--' : (Number(v)<0.01&&Number(v)>0 ? '<$0.01' : '$'+Number(v).toFixed(2)); }}
+function show(msg) {{ banner.textContent=msg; banner.classList.add('show'); }}
+function saveProxyKey() {{ sessionStorage.setItem('gpt2cc_proxy_key', proxyKey.value); loadUsage(); }}
+async function api(path) {{ const r=await fetch(path, {{headers:headers()}}); if(r.status===401) {{ authBox.classList.add('show'); throw new Error('需要代理密钥'); }} const data=await r.json(); if(!r.ok) throw new Error(data.error?.message||'请求失败'); return data; }}
+async function loadUsage() {{ try {{ banner.classList.remove('show'); [summary, history] = await Promise.all([api('/admin/usage/summary'), api('/admin/usage/history?limit=20')]); authBox.classList.toggle('show', AUTH_REQUIRED && !key()); render(); }} catch(e) {{ show(e.message); }} }}
+function card(label,value,sub='') {{ return `<div class=\"card\"><div class=\"label\">${{esc(label)}}</div><div class=\"value\">${{value}}</div><div class=\"sub\">${{esc(sub)}}</div></div>`; }}
+function render() {{ const t=summary?.totals||{{}}; cards.innerHTML=[card('总 Token 数',fmt((t.input_tokens||0)+(t.output_tokens||0)),`${{fmt(t.input_tokens)}} 输入 / ${{fmt(t.output_tokens)}} 输出`),card('总会话数',fmt(t.records),`日均 ${{fmt(t.records)}}`),card('预估费用',money(t.total_cost),t.has_pricing?'基于 provider_pricing':'未配置价格'),card('缓存命中率',pct(t.cache_hit_rate),`${{fmt(t.cache_read_input_tokens)}} 读取 / ${{fmt(t.cache_write_input_tokens)}} 写入`)].join(''); renderModels(); renderRequests(); renderCosts(); statsPath.textContent='统计文件：'+(summary?.stats_path||''); }}
+function renderModels() {{ const rows=summary?.merged_by_model||[]; const max=Math.max(1,...rows.map(r=>(r.input_tokens||0)+(r.output_tokens||0)+(r.cache_read_input_tokens||0))); modelDistribution.innerHTML=rows.length?rows.map(r=>{{ const total=(r.input_tokens||0)+(r.output_tokens||0)+(r.cache_read_input_tokens||0); return `<div class=\"model-row\"><div>${{esc(r.upstream_model)}}</div><div class=\"bar-track\"><div class=\"bar\" style=\"width:${{Math.max(2,total/max*100).toFixed(1)}}%\"></div></div><div class=\"muted\">${{fmt(total)}}</div></div>`; }}).join(''):'<div class=\"muted\">暂无模型用量</div>'; }}
+function dayKey(ts) {{ return String(ts||'').slice(0,10) || 'unknown'; }}
+function renderRequests() {{ const rows=(history?.records||[]).slice(0,20); requestRows.innerHTML=rows.length?rows.map(r=>{{ const cacheRead=r.cache_read_input_tokens||0; const cacheWrite=r.cache_write_input_tokens||0; const hit=r.cache_hit_rate==null?'--':pct(r.cache_hit_rate); const cache=cacheRead||cacheWrite?`${{hit}} · 读取 ${{fmt(cacheRead)}} / 写入 ${{fmt(cacheWrite)}}`:'未命中'; const providerModel=`${{r.provider_name||r.provider_id||''}} / ${{r.upstream_model||''}}`; return `<tr><td>${{esc(r.ts||'')}}</td><td>${{esc(providerModel)}}</td><td>${{fmt(r.input_tokens)}}</td><td>${{fmt(r.output_tokens)}}</td><td>${{esc(cache)}}</td><td>${{r.cost?money(r.cost.total):'未配置'}}</td></tr>`; }}).join(''):'<tr><td colspan="6" class="muted">暂无最近请求记录</td></tr>'; }}
+function renderCosts() {{ const rows=summary?.provider_model_breakdown||[]; costRows.innerHTML=rows.length?rows.map(r=>`<tr><td>${{esc(r.provider_name||r.provider_id)}}</td><td>${{esc(r.upstream_model)}}</td><td>${{fmt(r.input_tokens)}}</td><td>${{fmt(r.output_tokens)}}</td><td>${{fmt(r.cache_read_input_tokens)}}</td><td>${{r.has_pricing?money(r.total_cost):'未配置'}}</td></tr>`).join(''):'<tr><td colspan=\"6\" class=\"muted\">暂无成本明细</td></tr>'; }}
+loadUsage(); setInterval(()=>loadUsage(), 5000);
 </script>
 </body>
 </html>"""

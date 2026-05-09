@@ -67,7 +67,11 @@ class AdminServerTests(unittest.TestCase):
         self.assertIn("primaryBindDrawer", text)
         self.assertNotIn("prompt(", text)
         self.assertIn("routeSelection", text)
-        self.assertIn("syncRouteModels(preferredModel", text)
+        self.assertIn("function openForm()", text)
+        self.assertIn("onclick=\"openForm()\"", text)
+        self.assertIn("价格（可选", text)
+        self.assertIn("parsePricing()", text)
+        self.assertIn("provider_pricing", text)
         self.assertIn("setInterval", text)
         self.assertNotIn("sk-initial", text)
 
@@ -104,6 +108,25 @@ class AdminServerTests(unittest.TestCase):
         self.assertEqual(config["upstream_protocol"], "gemini")
         self.assertEqual(config["model"], "gpt-image-2")
         self.assertEqual(config["upstream_api_key"], "***")
+
+    def test_provider_pricing_api_saves_per_provider_model_prices(self):
+        status, _, data = self.request(
+            "POST",
+            "/admin/providers",
+            {
+                "id": "relay2",
+                "name": "Relay 2",
+                "protocol": "openai",
+                "upstream_base_url": "https://relay2.example/v1",
+                "upstream_api_key": "sk-relay2",
+                "models": ["gpt-4.1"],
+                "pricing": {"gpt-4.1": {"input_per_million": 2.5, "output_per_million": 10.0, "cache_read_per_million": 0.3}},
+            },
+        )
+        self.assertEqual(status, 200)
+        state = json.loads(data.decode("utf-8"))
+        self.assertEqual(state["provider_pricing"]["relay2"]["gpt-4.1"]["input_per_million"], 2.5)
+        self.assertNotIn("sk-relay2", data.decode("utf-8"))
 
     def test_invalid_provider_payload_returns_400(self):
         status, _, data = self.request(

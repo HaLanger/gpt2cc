@@ -51,6 +51,12 @@ class ImageEditRequest:
     reference_count: int
 
 
+@dataclass(slots=True)
+class ImageStreamResult:
+    usage: dict[str, int]
+    succeeded: bool
+
+
 def is_image_model(model: str, config: Config) -> bool:
     normalized = (model or "").strip().lower()
     if not normalized:
@@ -186,7 +192,7 @@ def stream_image_result_to_anthropic(
     ctx: TransformContext,
     writer: Writer,
     start_text: str,
-) -> None:
+) -> ImageStreamResult:
     message_id = f"msg_{uuid.uuid4().hex}"
     content_index = 0
     writer(encode_sse("message_start", new_message_start(ctx, message_id)))
@@ -206,12 +212,13 @@ def stream_image_result_to_anthropic(
         )
 
     write_delta(start_text)
-    output_tokens = 0
+    usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_write_input_tokens": 0}
+    succeeded = False
     try:
         result = operation()
         write_delta(result.text)
         usage = image_usage(result.raw_response)
-        output_tokens = usage.get("output_tokens", 0)
+        succeeded = True
     except UpstreamError as exc:
         LOG.warning("image upstream error %s: %s", exc.status, exc)
         write_delta(f"Image request failed: {exc}\n")
@@ -226,11 +233,12 @@ def stream_image_result_to_anthropic(
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
+                "usage": {"output_tokens": usage.get("output_tokens", 0)},
             },
         )
     )
     writer(encode_sse("message_stop", {"type": "message_stop"}))
+    return ImageStreamResult(usage=usage, succeeded=succeeded)
 
 
 def extract_image_prompt(request: dict[str, Any]) -> str:
@@ -410,6 +418,8 @@ def image_usage(response: dict[str, Any]) -> dict[str, int]:
     return {
         "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or usage.get("cached_tokens") or 0),
+        "cache_write_input_tokens": int(usage.get("cache_write_input_tokens") or usage.get("cache_creation_tokens") or 0),
     }
 
 
