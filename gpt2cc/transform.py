@@ -17,6 +17,7 @@ OPENAI_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 class TransformContext:
     requested_model: str
     upstream_model: str
+    upstream_base_url: str = ""
     route_source: str = "active"
     tool_name_to_upstream: dict[str, str] = field(default_factory=dict)
     tool_name_from_upstream: dict[str, str] = field(default_factory=dict)
@@ -50,7 +51,7 @@ def transform_anthropic_to_openai(request: dict[str, Any], config: Config) -> tu
     requested_model = str(request.get("model") or "")
     route = config.resolve_model_route(requested_model)
     upstream_model = route.upstream
-    ctx = TransformContext(requested_model=requested_model, upstream_model=upstream_model, route_source=route.source)
+    ctx = TransformContext(requested_model=requested_model, upstream_model=upstream_model, upstream_base_url=config.upstream_base_url, route_source=route.source)
 
     messages: list[dict[str, Any]] = []
     system_content = request.get("system")
@@ -344,7 +345,7 @@ def anthropic_message_from_openai(response: dict[str, Any], ctx: TransformContex
         "content": content,
         "stop_reason": map_finish_reason(finish_reason, bool(message.get("tool_calls"))),
         "stop_sequence": None,
-        "usage": convert_usage(usage),
+        "usage": convert_usage(usage, ctx.upstream_base_url),
     }
 
 
@@ -391,7 +392,7 @@ def parse_tool_arguments(value: Any) -> dict[str, Any]:
     return {"_value": parsed}
 
 
-def convert_usage(usage: dict[str, Any]) -> dict[str, int]:
+def convert_usage(usage: dict[str, Any], upstream_base_url: str = "") -> dict[str, int]:
     usage = usage if isinstance(usage, dict) else {}
     prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
     completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
@@ -403,6 +404,18 @@ def convert_usage(usage: dict[str, Any]) -> dict[str, int]:
         cache_write = prompt_details.get("cache_write_tokens")
     if cache_write in (None, ""):
         cache_write = completion_details.get("cache_write_tokens")
+
+    base_url = str(upstream_base_url or "").lower()
+    if "api.deepseek.com" in base_url:
+        cache_hit = usage.get("prompt_cache_hit_tokens")
+        cache_miss = usage.get("prompt_cache_miss_tokens")
+        if cache_hit not in (None, ""):
+            cache_read = cache_hit
+        if cache_miss not in (None, ""):
+            usage = dict(usage)
+            usage["prompt_tokens"] = cache_miss
+            usage["input_tokens"] = cache_miss
+
     return {
         "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),

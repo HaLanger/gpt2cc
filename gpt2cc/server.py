@@ -405,7 +405,7 @@ def make_handler(config: Config) -> type[BaseHTTPRequestHandler]:
             data = upstream_response.json()
             result = anthropic_message_from_openai(data, ctx)
             self._send_json(result)
-            self._record_usage(request, request_config, "chat/completions", False, convert_usage(data.get("usage") or {}), ctx.upstream_model)
+            self._record_usage(request, request_config, "chat/completions", False, convert_usage(data.get("usage") or {}, request_config.upstream_base_url), ctx.upstream_model)
 
         def _handle_count_tokens(self) -> None:
             self._require_auth()

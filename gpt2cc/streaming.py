@@ -147,7 +147,7 @@ class StreamState:
         self.ensure_message_start()
         self.close_text_block()
         self.close_tool_blocks()
-        usage = convert_usage(self.usage)
+        usage = convert_usage(self.usage, self.ctx.upstream_base_url)
         stop_reason = map_finish_reason(self.finish_reason, False)
         self.send(
             "message_delta",

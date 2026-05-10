@@ -2,7 +2,7 @@ import json
 import unittest
 
 from gpt2cc.config import Config
-from gpt2cc.transform import anthropic_message_from_openai, transform_anthropic_to_openai
+from gpt2cc.transform import anthropic_message_from_openai, convert_usage, transform_anthropic_to_openai
 
 
 class TransformTests(unittest.TestCase):
@@ -117,6 +117,27 @@ class TransformTests(unittest.TestCase):
             payload["messages"][0]["reasoning_content"],
             json.dumps({"type": "thinking", "thinking": "reasoning", "signature": "sig_1"}, ensure_ascii=False),
         )
+    def test_deepseek_usage_uses_hit_and_miss_tokens(self):
+        usage = convert_usage(
+            {
+                "prompt_tokens": 999,
+                "completion_tokens": 12,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 20,
+            },
+            "https://api.deepseek.com/v1",
+        )
+        self.assertEqual(
+            usage,
+            {
+                "input_tokens": 20,
+                "output_tokens": 12,
+                "cache_read_input_tokens": 80,
+                "cache_write_input_tokens": 0,
+            },
+        )
+
+
     def test_model_route_source_is_exposed_in_context(self):
         payload, ctx = transform_anthropic_to_openai(
             {"model": "claude-opus-4-7", "messages": []},

@@ -78,10 +78,12 @@ def utc_now_iso() -> str:
 
 
 def calculate_cache_hit_rate(input_tokens: int, cache_read_input_tokens: int) -> float | None:
-    denominator = int(input_tokens) + int(cache_read_input_tokens)
+    input_value = max(0, int(input_tokens))
+    cache_value = max(0, int(cache_read_input_tokens))
+    denominator = max(input_value, cache_value)
     if denominator <= 0:
         return None
-    return int(cache_read_input_tokens) / denominator
+    return cache_value / denominator
 
 
 def _coerce_int(value: Any) -> int:
@@ -150,9 +152,13 @@ def compute_usage_cost(token_counts: dict[str, int], price: UsagePrice | None) -
         return None
     if all(getattr(price, field) is None for field in PRICE_FIELDS):
         return None
-    input_cost = _decimal_cost(_coerce_int(token_counts.get("input_tokens")), price.input_per_million)
-    output_cost = _decimal_cost(_coerce_int(token_counts.get("output_tokens")), price.output_per_million)
-    cache_read_cost = _decimal_cost(_coerce_int(token_counts.get("cache_read_input_tokens")), price.cache_read_per_million)
+    input_tokens = _coerce_int(token_counts.get("input_tokens"))
+    cache_read_tokens = _coerce_int(token_counts.get("cache_read_input_tokens"))
+    billable_input_tokens = max(0, input_tokens - cache_read_tokens)
+    output_tokens = _coerce_int(token_counts.get("output_tokens"))
+    input_cost = _decimal_cost(billable_input_tokens, price.input_per_million)
+    output_cost = _decimal_cost(output_tokens, price.output_per_million)
+    cache_read_cost = _decimal_cost(cache_read_tokens, price.cache_read_per_million)
     total = input_cost + output_cost + cache_read_cost
     return UsageCost(
         input=_quantize_cost(input_cost),

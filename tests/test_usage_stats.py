@@ -57,13 +57,13 @@ class UsageStatsTests(unittest.TestCase):
         self.assertEqual(len(reloaded.records), 1)
         self.assertEqual(usage_record_to_dict(reloaded.records[0]), usage_record_to_dict(record))
         self.assertEqual(payload["records"][0]["price"]["provider_id"], "xlab")
-        self.assertAlmostEqual(payload["records"][0]["cache_hit_rate"], 67 / (123 + 67))
-        self.assertAlmostEqual(payload["records"][0]["cost"]["total"], 0.0007776)
+        self.assertAlmostEqual(payload["records"][0]["cache_hit_rate"], 67 / 123)
+        self.assertAlmostEqual(payload["records"][0]["cost"]["total"], 0.0006101, places=7)
 
     def test_cache_hit_rate_helper_behavior(self):
         self.assertIsNone(calculate_cache_hit_rate(0, 0))
         self.assertEqual(calculate_cache_hit_rate(0, 50), 1.0)
-        self.assertAlmostEqual(calculate_cache_hit_rate(123, 67), 67 / 190)
+        self.assertAlmostEqual(calculate_cache_hit_rate(123, 67), 67 / 123)
 
     def test_summary_aggregates_cache_hit_rate_once(self):
         records = [
@@ -104,7 +104,7 @@ class UsageStatsTests(unittest.TestCase):
         self.assertEqual(summary.output_tokens, 30)
         self.assertEqual(summary.cache_read_input_tokens, 200)
         self.assertEqual(summary.cache_write_input_tokens, 20)
-        self.assertAlmostEqual(summary.cache_hit_rate, 200 / 600)
+        self.assertAlmostEqual(summary.cache_hit_rate, 200 / 400)
 
     def test_load_tolerates_malformed_optional_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -143,7 +143,7 @@ class UsageStatsTests(unittest.TestCase):
         self.assertEqual(record.cache_write_input_tokens, 0)
         self.assertIsNone(record.price)
         self.assertIsNotNone(record.cost)
-        self.assertAlmostEqual(record.cache_hit_rate, 67 / 190)
+        self.assertAlmostEqual(record.cache_hit_rate, 67 / 123)
     def test_concurrent_appends_keep_all_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "usage.stats.json"
@@ -173,6 +173,55 @@ class UsageStatsTests(unittest.TestCase):
             document = load_usage_stats(path)
         self.assertEqual(len(document.records), 20)
         self.assertEqual(sum(record.input_tokens for record in document.records), sum(range(20)))
+
+    def test_cost_uses_uncached_input_only_and_clamps_when_cache_exceeds_input(self):
+        price = UsagePrice(
+            provider_id="relay",
+            model="deepseek",
+            input_per_million=2.0,
+            output_per_million=8.0,
+            cache_read_per_million=0.5,
+        )
+        normal = build_usage_record(
+            ts="2026-05-09T00:00:00Z",
+            protocol="anthropic",
+            requested_model="claude-sonnet-4-6",
+            provider_id="relay",
+            provider_name="Relay",
+            upstream_model="deepseek",
+            route_source="active",
+            stream=False,
+            endpoint="anthropic/messages",
+            input_tokens=100,
+            output_tokens=25,
+            cache_read_input_tokens=40,
+            price=price,
+        )
+        self.assertIsNotNone(normal.cost)
+        self.assertAlmostEqual(normal.cost.input, 0.00012)
+        self.assertAlmostEqual(normal.cost.output, 0.0002)
+        self.assertAlmostEqual(normal.cost.cache_read, 0.00002)
+        self.assertAlmostEqual(normal.cost.total, 0.00034)
+
+        cache_heavy = build_usage_record(
+            ts="2026-05-09T00:00:01Z",
+            protocol="anthropic",
+            requested_model="claude-sonnet-4-6",
+            provider_id="relay",
+            provider_name="Relay",
+            upstream_model="deepseek",
+            route_source="active",
+            stream=False,
+            endpoint="anthropic/messages",
+            input_tokens=50,
+            output_tokens=10,
+            cache_read_input_tokens=80,
+            price=price,
+        )
+        self.assertIsNotNone(cache_heavy.cost)
+        self.assertAlmostEqual(cache_heavy.cost.input, 0.0)
+        self.assertAlmostEqual(cache_heavy.cost.cache_read, 0.00004)
+        self.assertAlmostEqual(cache_heavy.cost.total, 0.00012)
 
 
 if __name__ == "__main__":
